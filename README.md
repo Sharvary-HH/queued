@@ -23,9 +23,128 @@ These are the reasons the project exists. Each one gets a test in
 
 ## Status
 
-Phases 0 and 1 are done: layout, build, lint config, a compose stack with
-Postgres, and the schema. Everything else is marked in the source with the phase
-that fills it in.
+Phases 0–2 are done: scaffold, schema, and the claim query with its tests.
+Everything else is marked in the source with the phase that fills it in.
+
+## The claim query
+
+`internal/queue/store.go`. This is the core of the project.
+
+```sql
+WITH candidate AS (
+    SELECT id FROM jobs
+    WHERE state = 'pending'
+      AND queue = $1
+      AND run_at <= now()
+    ORDER BY priority ASC, run_at ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT $3
+), claimed AS (
+    UPDATE jobs SET
+        state            = 'claimed',
+        claimed_at       = now(),
+        claimed_by       = $2,
+        claim_expires_at = now() + make_interval(secs => visibility_timeout_seconds),
+        attempt          = attempt + 1
+    WHERE id IN (SELECT id FROM candidate)
+    RETURNING ...
+), history AS (
+    INSERT INTO job_attempts (job_id, attempt, worker_id, started_at)
+    SELECT id, attempt, $2, now() FROM claimed
+)
+SELECT ... FROM claimed ORDER BY priority ASC, run_at ASC
+```
+
+**Why `SKIP LOCKED`.** Without it, a worker whose index scan reaches a row
+another worker has locked *blocks* until that worker's transaction ends. Every
+worker then queues up behind whichever one got to the head of the queue first,
+and N workers deliver the throughput of one — worse, actually, since you now pay
+for the lock waits too. With `SKIP LOCKED` a locked row is stepped over and the
+scan keeps going, so each worker walks away with a disjoint set and no worker
+ever waits on another. This one clause is the entire reason Postgres is a
+viable queue rather than a bottleneck pretending to be one.
+
+**Why the subquery.** `FOR UPDATE` is what makes the choice of rows exclusive,
+and it can only be attached to a `SELECT`. You cannot write
+`UPDATE ... ORDER BY ... LIMIT ... FOR UPDATE`. So the selection happens in a
+subquery that takes the locks, and the `UPDATE` operates on the ids it returns.
+
+**Why `attempt` increments at claim time, not at failure time.** A worker that
+is SIGKILLed, loses its network, or wedges never reports anything at all. A
+counter that only advanced on a *reported* failure would therefore never advance
+for exactly the jobs most likely to be killing workers, and a poison job would
+be reclaimed forever. Charging the attempt up front means such a job still walks
+to the DLQ. The cost is real — a worker restarted mid-job makes its job pay for
+the interruption — and it is the right trade: bounded retries (property 4)
+matter more than squeezing a last attempt out of an unlucky job.
+
+**Why the attempt row is written in the same statement.** If the worker inserted
+into `job_attempts` after the claim returned, a worker that died in between
+would leave no trace of having taken the job at all. Writing it inside the claim
+means every claim is on the record before anyone can act on it.
+
+### The reaper's index
+
+Migration 0002 adds `claim_expires_at`. The natural way to write the reaper is
+
+```sql
+WHERE state = 'claimed'
+  AND claimed_at + make_interval(secs => visibility_timeout_seconds) < now()
+```
+
+which cannot use an index: the timeout is per-row, so the comparison spans two
+columns of the same row and the planner has to sequential-scan to evaluate it.
+That is fine on a small table and quietly becomes the most expensive thing in
+the system on a large one — and the reaper runs every few seconds, forever.
+Materialising the deadline at claim time turns it into a range scan. With 20,050
+claimed rows of which 55 are expired:
+
+```
+Limit (actual time=0.068..0.081 rows=55 loops=1)
+  ->  LockRows
+        ->  Sort
+              ->  Bitmap Heap Scan on jobs
+                    ->  Bitmap Index Scan on jobs_reap_idx (actual time=0.007..0.007 rows=55)
+                          Index Cond: (claim_expires_at < now())
+Execution Time: 0.116 ms
+```
+
+It touches the 55 expired rows, not the 20,000 live ones.
+
+### Guarding against stale claims
+
+`Complete`, `Fail` and `Release` all carry `AND claimed_by = $2`. This is not
+decoration. If the reaper has already decided a worker is dead and handed its
+job to somebody else, the slow worker coming back to report must not be allowed
+to mark the job succeeded while the new owner is still running it. The update
+matches nothing and the caller gets `ErrStaleClaim` instead.
+
+### What is proven so far
+
+`go test -race ./internal/queue` — 15 tests, all against a real Postgres started
+by testcontainers (see `internal/testutil`). Nothing is mocked: SKIP LOCKED
+handing disjoint sets to concurrent transactions *is* the mechanism, and a fake
+would only prove that the fake agrees with itself.
+
+| test | what it pins down |
+| --- | --- |
+| `ClaimHandsOutDisjointSets` | 1000 jobs, 20 concurrent claimers, no id returned twice, all 1000 accounted for (property 1) |
+| `ClaimSkipsAlreadyClaimed` | a claimed job is invisible to the next claimer |
+| `ClaimIncrementsAttemptAndRecordsHistory` | attempt moves at claim, expiry is set, the attempt row exists immediately |
+| `ClaimRespectsPriorityThenRunAt` | ordering is honoured |
+| `ClaimIgnoresFutureAndOtherQueues` | delayed jobs and other queues stay invisible |
+| `CompleteClosesTheAttempt` | success closes the history row |
+| `CompleteAndFailRejectStaleClaims` | a worker cannot report on a job it no longer holds |
+| `FailSchedulesRetryThenGivesUp` | retries, then `dead` after exactly `max_attempts`, and no more (property 4) |
+| `FailPermanentSkipsTheRetryBudget` | a permanent error goes straight to `dead` |
+| `ReapReturnsExpiredClaims` | an unreported claim comes back and another worker runs it (property 2) |
+| `ReapSendsExhaustedJobsToTheDLQ` | a job that keeps killing workers still stops |
+| `ReleaseReturnsJobsImmediately` | explicit handback, no visibility-timeout wait (backs property 3) |
+| `EnqueueIdempotencyKeyDedupes` | two enqueues, one row |
+| `EnqueueIdempotencyKeyUnderRace` | 16 concurrent enqueues with one key: one row, one reported insert |
+| `EnqueueRejectsBadInput` | missing kind, bad JSON, empty key, zero max_attempts |
+
+`ClaimHandsOutDisjointSets` also passes under `-race -count=10`.
 
 ## Schema
 

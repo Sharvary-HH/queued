@@ -10,8 +10,17 @@ const (
 	StatePending   State = "pending"
 	StateClaimed   State = "claimed"
 	StateSucceeded State = "succeeded"
-	StateFailed    State = "failed"
-	StateDead      State = "dead"
+
+	// StateFailed is defined by the enum but nothing in the state machine
+	// writes it. A failed attempt with retries left goes back to 'pending' with
+	// run_at pushed into the future, which is what makes the claim query a
+	// single-value equality test on the hot path; a failed attempt with no
+	// retries left goes to 'dead'. There is no moment in between for a job to
+	// sit in. It is kept so that reading the enum does not require also reading
+	// this comment to know the value never appears.
+	StateFailed State = "failed"
+
+	StateDead State = "dead"
 )
 
 func (s State) Valid() bool {
@@ -39,6 +48,9 @@ type Job struct {
 	// VisibilityTimeout is how long a claim is honoured before the reaper is
 	// allowed to hand the job to somebody else.
 	VisibilityTimeout time.Duration
+	// ClaimExpiresAt is claimed_at + VisibilityTimeout, materialised at claim
+	// time so the reaper's scan is a plain range over an index.
+	ClaimExpiresAt *time.Time
 
 	LastError      *string
 	IdempotencyKey *string
