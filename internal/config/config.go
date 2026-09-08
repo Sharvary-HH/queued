@@ -11,6 +11,9 @@ import (
 // environment so the same image works in compose and in prod.
 type Config struct {
 	DatabaseURL string
+	// DBMaxConns caps the connection pool. Zero means "work it out from the
+	// concurrency", which each binary does for itself.
+	DBMaxConns int
 
 	// Server
 	HTTPAddr string
@@ -51,6 +54,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.VisibilitySec, err = envInt("VISIBILITY_TIMEOUT_SECONDS", c.VisibilitySec); err != nil {
+		return c, err
+	}
+	if c.DBMaxConns, err = envInt("DB_MAX_CONNS", 0); err != nil {
 		return c, err
 	}
 	if c.PollInterval, err = envDur("POLL_INTERVAL", c.PollInterval); err != nil {

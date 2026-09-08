@@ -201,15 +201,12 @@ func TestCompleteClosesTheAttempt(t *testing.T) {
 	store, _ := newStore(t)
 	seed(t, store, 1, "noop")
 
-	claimed, err := store.Claim(ctx, "default", "worker-a", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Complete(ctx, claimed[0].ID, "worker-a"); err != nil {
+	claimed := mustClaimOne(t, store, "worker-a")
+	if err := store.Complete(ctx, claimed.ID, "worker-a"); err != nil {
 		t.Fatal(err)
 	}
 
-	job, err := store.JobByID(ctx, claimed[0].ID)
+	job, err := store.JobByID(ctx, claimed.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,19 +232,14 @@ func TestCompleteAndFailRejectStaleClaims(t *testing.T) {
 	store, _ := newStore(t)
 	seed(t, store, 1, "noop")
 
-	claimed, err := store.Claim(ctx, "default", "worker-a", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := claimed[0].ID
+	id := mustClaimOne(t, store, "worker-a").ID
 
 	if err := store.Complete(ctx, id, "worker-b"); err == nil {
 		t.Error("worker-b completed a job held by worker-a")
 	}
-	_, err = store.Fail(ctx, queue.FailRequest{
+	if _, err := store.Fail(ctx, queue.FailRequest{
 		JobID: id, WorkerID: "worker-b", Err: "boom", RetryAt: time.Now(),
-	})
-	if err == nil {
+	}); err == nil {
 		t.Error("worker-b failed a job held by worker-a")
 	}
 }
@@ -321,12 +313,9 @@ func TestFailPermanentSkipsTheRetryBudget(t *testing.T) {
 	store, _ := newStore(t)
 	seed(t, store, 1, "bad-payload")
 
-	claimed, err := store.Claim(ctx, "default", "worker-a", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	claimed := mustClaimOne(t, store, "worker-a")
 	state, err := store.Fail(ctx, queue.FailRequest{
-		JobID:     claimed[0].ID,
+		JobID:     claimed.ID,
 		WorkerID:  "worker-a",
 		Err:       "payload is not valid",
 		RetryAt:   time.Now(),
@@ -565,6 +554,20 @@ func TestEnqueueRejectsBadInput(t *testing.T) {
 			}
 		})
 	}
+}
+
+// mustClaimOne fails the test loudly when nothing is claimable, instead of
+// panicking on claimed[0] and leaving the reason to be guessed from a stack.
+func mustClaimOne(t *testing.T, s *queue.Store, workerID string) queue.Job {
+	t.Helper()
+	claimed, err := s.Claim(context.Background(), "default", workerID, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed %d jobs, want 1", len(claimed))
+	}
+	return claimed[0]
 }
 
 func mustEnqueue(t *testing.T, s *queue.Store, p queue.EnqueueParams) queue.Job {

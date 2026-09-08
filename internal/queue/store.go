@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -318,6 +319,49 @@ func (s *Store) Release(ctx context.Context, jobIDs []int64, workerID, reason st
 	return tag.RowsAffected(), nil
 }
 
+// requeueSQL resets a dead job so it can run again.
+//
+// attempt goes back to 0 rather than being left where it was, because a requeue
+// is an operator saying "I fixed the thing that was breaking this" — the
+// previous failures are history, not a budget already spent. Leaving the
+// counter would give the job one attempt and send it straight back to the DLQ,
+// which makes the button useless exactly when it matters.
+//
+// The history in job_attempts is deliberately not touched. Those rows are the
+// record of what actually happened, and a job that failed five times and was
+// then requeued should still show all five when somebody asks why.
+const requeueSQL = `
+UPDATE jobs SET
+    state            = 'pending',
+    attempt          = 0,
+    run_at           = now(),
+    claimed_at       = NULL,
+    claimed_by       = NULL,
+    claim_expires_at = NULL,
+    last_error       = NULL
+WHERE id = $1 AND state = 'dead'
+RETURNING ` + jobColumns
+
+// ErrNotDead is returned when a requeue targets a job that is not in the DLQ.
+var ErrNotDead = errors.New("queue: job is not in the dead-letter queue")
+
+// Requeue moves a dead job back to pending with a fresh retry budget.
+func (s *Store) Requeue(ctx context.Context, jobID int64) (Job, error) {
+	job, err := scanJob(s.pool.QueryRow(ctx, requeueSQL, jobID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Either it does not exist or it is not dead. Tell the two apart, so
+		// the API can answer 404 or 409 rather than guessing.
+		if _, lookupErr := s.JobByID(ctx, jobID); lookupErr != nil {
+			return Job{}, lookupErr
+		}
+		return Job{}, fmt.Errorf("requeue job %d: %w", jobID, ErrNotDead)
+	}
+	if err != nil {
+		return Job{}, fmt.Errorf("requeue job %d: %w", jobID, err)
+	}
+	return job, nil
+}
+
 func collectJobs(rows pgx.Rows) ([]Job, error) {
 	var out []Job
 	for rows.Next() {
@@ -349,10 +393,27 @@ func scanJob(row pgx.Row) (Job, error) {
 // Connect opens a pool and waits for the database to answer. Compose starts
 // Postgres and the app at the same time, so a bit of patience here saves a
 // restart loop.
-func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+//
+// maxConns of 0 keeps pgx's default, which is max(4, numCPU) — and that default
+// is a trap for this program specifically. A worker needs one connection per
+// executor reporting a result, plus one for the claimer, plus one for the
+// reaper, plus one the NOTIFY listener holds for its entire life and never
+// gives back. At the default CONCURRENCY of 8 that is eleven consumers sharing
+// eight connections, and on a four-core box it would be eleven sharing four.
+// Nothing breaks — pgx just queues — so the symptom is not an error but
+// everything mysteriously going slower under load, which is the worst kind of
+// bug to be handed. Callers size it deliberately.
+func Connect(ctx context.Context, dsn string, maxConns int) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	if maxConns > 0 {
+		// An explicit max_conns in the DSN is the operator being specific, so
+		// leave it alone.
+		if !strings.Contains(dsn, "pool_max_conns") {
+			cfg.MaxConns = int32(maxConns)
+		}
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)

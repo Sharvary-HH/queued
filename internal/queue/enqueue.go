@@ -139,6 +139,21 @@ func (s *Store) EnqueueMany(ctx context.Context, params []EnqueueParams) (int64,
 		return 0, nil
 	}
 
+	// COPY cannot call now(), so an unspecified run_at has to be filled in with
+	// a concrete timestamp — and it must be the *server's* clock, not this
+	// process's. Claim compares run_at against the database's now(), so a
+	// client running even slightly ahead would write jobs whose run_at is in
+	// the database's future and which are therefore invisible to every worker
+	// until the skew elapses. That failure is silent and looks like a stuck
+	// queue, which is a miserable thing to debug.
+	//
+	// One extra round trip per bulk load, which is nothing next to the COPY
+	// itself, and it makes EnqueueMany agree with Enqueue's COALESCE(..., now()).
+	var serverNow time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&serverNow); err != nil {
+		return 0, fmt.Errorf("enqueue many: read server clock: %w", err)
+	}
+
 	rows := make([][]any, 0, len(params))
 	for i, p := range params {
 		if err := p.validate(); err != nil {
@@ -158,7 +173,7 @@ func (s *Store) EnqueueMany(ctx context.Context, params []EnqueueParams) (int64,
 		}
 		runAt := p.RunAt
 		if runAt.IsZero() {
-			runAt = time.Now()
+			runAt = serverNow
 		}
 		priority := 100
 		if p.Priority != nil {

@@ -170,7 +170,25 @@ func (p *Pool) claim(ctx context.Context, l *listener, out chan<- queue.Job) {
 			return
 		}
 
-		batch, err := p.store.Claim(ctx, p.cfg.Queue, p.cfg.WorkerID, p.cfg.ClaimBatch)
+		// The claim query deliberately does not inherit the shutdown
+		// cancellation, and this is not a detail.
+		//
+		// Cancelling a claim mid-flight is the one way this pool can strand
+		// jobs. pgx gives up on the query and returns an error, but the UPDATE
+		// may already have committed on the server — the cancellation and the
+		// commit race, and the client cannot tell which won. The rows are then
+		// marked claimed by a worker that never learned it had them, so nothing
+		// releases them and they sit until the reaper's visibility timeout:
+		// exactly the stall property 3 exists to prevent, arriving through the
+		// shutdown path itself.
+		//
+		// Letting a short indexed query finish costs milliseconds and makes the
+		// outcome always knowable. Whatever comes back is then either
+		// dispatched or released.
+		claimCtx, cancelClaim := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		batch, err := p.store.Claim(claimCtx, p.cfg.Queue, p.cfg.WorkerID, p.cfg.ClaimBatch)
+		cancelClaim()
+
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -183,6 +201,14 @@ func (p *Pool) claim(ctx context.Context, l *listener, out chan<- queue.Job) {
 				return
 			}
 			continue
+		}
+
+		// Shutdown arrived while the claim was in flight. These jobs are ours
+		// and nothing is going to run them, so give them back now rather than
+		// letting them expire.
+		if ctx.Err() != nil {
+			p.releaseSlice(batch, "worker shut down while claiming")
+			return
 		}
 
 		for i, job := range batch {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/Sharvary-HH/queued/internal/logging"
 	"github.com/Sharvary-HH/queued/internal/migrate"
 	"github.com/Sharvary-HH/queued/internal/queue"
+	"github.com/Sharvary-HH/queued/internal/worker"
 	"github.com/Sharvary-HH/queued/migrations"
 )
 
@@ -41,7 +43,14 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	pool, err := queue.Connect(ctx, cfg.DatabaseURL)
+	// The server serves HTTP and runs a reaper; it has no executors, so a
+	// modest pool is plenty.
+	maxConns := cfg.DBMaxConns
+	if maxConns == 0 {
+		maxConns = 10
+	}
+
+	pool, err := queue.Connect(ctx, cfg.DatabaseURL, maxConns)
 	if err != nil {
 		return err
 	}
@@ -58,9 +67,22 @@ func run() error {
 		return nil
 	}
 
+	store := queue.NewStore(pool)
+
+	// The server reaps too. If reclaiming only happened in worker processes,
+	// then the one failure that most needs recovering from — every worker dying
+	// at once — would be the one case with nobody left to do it.
+	var reaperDone sync.WaitGroup
+	reaperDone.Add(1)
+	go func() {
+		defer reaperDone.Done()
+		worker.NewReaper(store, log, worker.ReaperConfig{Interval: cfg.ReapInterval}).Run(ctx)
+	}()
+	defer reaperDone.Wait()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewServer(queue.NewStore(pool), log).Routes(),
+		Handler:           api.NewServer(store, log).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

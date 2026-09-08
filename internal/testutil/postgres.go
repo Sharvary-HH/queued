@@ -110,7 +110,18 @@ func DB(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("build test dsn: %v", err)
 	}
 
-	pool, err := pgxpool.New(ctx, dsn)
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse test dsn: %v", err)
+	}
+	// Sized like a real worker: an executor per slot, plus claimer, reaper, and
+	// the connection the NOTIFY listener never gives back. pgx's default of
+	// max(4, numCPU) is smaller than that at the concurrency these tests use,
+	// and the resulting queueing shows up as tests that are mysteriously slow
+	// rather than as any kind of error.
+	poolCfg.MaxConns = 14
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		t.Fatalf("connect to test database: %v", err)
 	}

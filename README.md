@@ -23,8 +23,94 @@ These are the reasons the project exists. Each one gets a test in
 
 ## Status
 
-Phases 0–3 are done: scaffold, schema, the claim query, and the worker pool.
-Everything else is marked in the source with the phase that fills it in.
+Phases 0–4 are done: scaffold, schema, the claim query, the worker pool, and
+retries/DLQ/reaper. Everything else is marked in the source with the phase that
+fills it in.
+
+## The reaper
+
+`internal/worker/reaper.go`. A loop that returns jobs whose claim outlived its
+visibility timeout.
+
+This is the whole of the worker-death machinery, and it is deliberately almost
+nothing: **there is no heartbeat, no worker registry, no liveness protocol.** A
+claim carries an expiry, and if nobody reports a result before it passes, the
+job goes back. Nothing in the system ever needs to decide whether a worker is
+alive — a question that is genuinely hard to answer and easy to answer wrongly.
+
+Every instance runs its own reaper, including the API server. There is no
+election and none is wanted: the sweep uses `FOR UPDATE SKIP LOCKED`, so
+concurrent reapers divide the expired rows rather than fight over them. A reaper
+is a janitor, not a singleton service, and several are strictly safer than one
+that might be on the instance that just died. The server runs one too, because
+otherwise the failure that most needs recovering from — every worker dying at
+once — is the one case with nobody left to fix it.
+
+**Every reclaim is logged individually, at warn.** A reclaim is never normal: it
+means a worker died holding that job, or a handler ran past its timeout. A
+counter alone does not tell you which job and which worker at 3am.
+
+```json
+{"level":"WARN","msg":"job reclaimed from an expired claim","job_id":41,"attempt":2,"lost_worker_id":"worker-7","returned_to":"pending"}
+```
+
+A sweep keeps going while batches come back full, so a fleet-wide restart is
+cleared in a few queries rather than one batch per tick.
+
+Demonstrated on the compose stack — 30 jobs of 8s work each with a 20s
+visibility timeout, spread over three workers, then `docker kill -s KILL` on one
+of them so it has no chance to clean up after itself:
+
+```
+victim = 6ed93279e6fe-1, holding: 10 jobs
+$ docker kill -s KILL goproject-worker-1
+
+=== reclaims by lost worker ===
+  10 "lost_worker_id":"6ed93279e6fe-1"
+
+=== final ===
+   state   | count
+-----------+-------
+ succeeded |    30
+```
+
+Exactly the ten jobs the killed worker was holding came back, nobody else's
+were disturbed, and all thirty finished.
+
+### Two timeouts, and which one fires first
+
+A handler that runs too long is caught by the **pool**, not the reaper: the
+job's context carries its visibility timeout as a deadline, so the pool cancels
+it, fails the job, and frees the slot. The reaper never sees it.
+
+That ordering matters. If only the reaper enforced the timeout, a hung handler
+would hold its slot indefinitely while a second worker ran the same job
+alongside it. Cancelling locally means the slot comes back and there is only one
+execution in flight. The reaper is the backstop for the case the pool cannot
+handle — a process that is simply gone.
+
+### Connection pool sizing
+
+pgx defaults `MaxConns` to `max(4, numCPU)`. A worker needs one connection per
+executor reporting a result, plus the claimer, plus the reaper, plus one the
+NOTIFY listener holds for its entire life and never gives back. At the default
+`CONCURRENCY=8` that is eleven consumers sharing eight connections; on a
+four-core box with `CONCURRENCY=32` it would be thirty-five sharing four.
+
+Nothing errors when this happens — pgx just queues — so the symptom is not a
+failure but everything getting slower under load, which is a miserable thing to
+debug. The worker therefore sizes its pool as `CONCURRENCY + 4`, overridable
+with `DB_MAX_CONNS`.
+
+### Requeue resets `attempt` to 0
+
+A requeue is an operator saying "I fixed the thing that was breaking this". The
+previous failures are history, not a budget already spent — handing the job back
+with a spent counter would send it straight back to the DLQ on its first
+attempt, making the button useless exactly when it matters.
+
+`job_attempts` is deliberately untouched. A job that failed five times and was
+then requeued should still show all five when somebody asks why.
 
 ## The worker pool
 

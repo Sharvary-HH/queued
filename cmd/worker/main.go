@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/Sharvary-HH/queued/internal/config"
@@ -34,7 +35,16 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	pool, err := queue.Connect(ctx, cfg.DatabaseURL)
+	// One connection per executor reporting a result, plus the claimer, the
+	// reaper, and the one the NOTIFY listener holds for its whole life. Sizing
+	// this off Concurrency rather than taking pgx's numCPU default is what stops
+	// a high-concurrency worker from quietly queueing on connection acquisition.
+	maxConns := cfg.DBMaxConns
+	if maxConns == 0 {
+		maxConns = cfg.Concurrency + 4
+	}
+
+	pool, err := queue.Connect(ctx, cfg.DatabaseURL, maxConns)
 	if err != nil {
 		return err
 	}
@@ -45,7 +55,20 @@ func run() error {
 	// only place in the project that knows what the jobs actually do.
 	handlers.NewSet().Register(reg)
 
-	w := worker.New(queue.NewStore(pool), reg, log, worker.Config{
+	store := queue.NewStore(pool)
+
+	// Every worker runs a reaper. They do not coordinate and do not need to:
+	// the sweep uses SKIP LOCKED, so concurrent reapers split the expired rows
+	// rather than fight over them. Running one everywhere means the recovery
+	// mechanism is not itself a single point of failure.
+	var reaperDone sync.WaitGroup
+	reaperDone.Add(1)
+	go func() {
+		defer reaperDone.Done()
+		worker.NewReaper(store, log, worker.ReaperConfig{Interval: cfg.ReapInterval}).Run(ctx)
+	}()
+
+	w := worker.New(store, reg, log, worker.Config{
 		Queue:        cfg.Queue,
 		WorkerID:     cfg.WorkerID,
 		Concurrency:  cfg.Concurrency,
@@ -53,5 +76,7 @@ func run() error {
 		PollInterval: cfg.PollInterval,
 		DrainTimeout: cfg.DrainTimeout,
 	})
-	return w.Run(ctx)
+	err = w.Run(ctx)
+	reaperDone.Wait()
+	return err
 }
