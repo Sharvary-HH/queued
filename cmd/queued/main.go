@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,10 +13,17 @@ import (
 	"github.com/Sharvary-HH/queued/internal/api"
 	"github.com/Sharvary-HH/queued/internal/config"
 	"github.com/Sharvary-HH/queued/internal/logging"
+	"github.com/Sharvary-HH/queued/internal/migrate"
 	"github.com/Sharvary-HH/queued/internal/queue"
+	"github.com/Sharvary-HH/queued/migrations"
 )
 
+// migrateOnly makes `queued -migrate` apply the schema and exit, which is what
+// `make migrate` calls. Without the flag the server migrates on boot anyway.
+var migrateOnly = flag.Bool("migrate", false, "apply migrations and exit")
+
 func main() {
+	flag.Parse()
 	if err := run(); err != nil {
 		// The logger may not exist yet if config failed, so use the default one.
 		logging.New("info", "queued").Error("fatal", "error", err)
@@ -39,6 +47,16 @@ func run() error {
 	}
 	defer pool.Close()
 	log.Info("connected to postgres")
+
+	// Migrating on every boot is safe because the runner takes an advisory lock
+	// and skips what is already applied, and it means there is no ordering
+	// requirement between this service and the workers in compose.
+	if err := migrate.Run(ctx, pool, migrations.FS, log); err != nil {
+		return err
+	}
+	if *migrateOnly {
+		return nil
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
