@@ -1,0 +1,33 @@
+run:
+  timeout: 3m
+
+linters:
+  enable:
+    - bodyclose
+    - errcheck
+    - errorlint
+    - govet
+    - ineffassign
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - unconvert
+    - unused
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+  revive:
+    rules:
+      - name: exported
+        disabled: true
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck

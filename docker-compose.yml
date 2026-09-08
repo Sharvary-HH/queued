@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: queued
+      POSTGRES_PASSWORD: queued
+      POSTGRES_DB: queued
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queued -d queued"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    command:
+      # The claim query is the hot path and we want to be able to read what it
+      # actually did, so keep statement logging cheap but timing on.
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - track_io_timing=on
+
+  queued:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://queued:queued@postgres:5432/queued?sslmode=disable
+      HTTP_ADDR: ":8080"
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+
+  worker:
+    build: .
+    entrypoint: ["/worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://queued:queued@postgres:5432/queued?sslmode=disable
+      QUEUE: default
+      CONCURRENCY: "8"
+      LOG_LEVEL: info
+    deploy:
+      replicas: 3
+    stop_grace_period: 40s
+
+volumes:
+  pgdata:
