@@ -23,8 +23,134 @@ These are the reasons the project exists. Each one gets a test in
 
 ## Status
 
-Phases 0–2 are done: scaffold, schema, and the claim query with its tests.
+Phases 0–3 are done: scaffold, schema, the claim query, and the worker pool.
 Everything else is marked in the source with the phase that fills it in.
+
+## The worker pool
+
+`internal/worker/pool.go`. One claimer goroutine feeding N executors over a
+buffered channel.
+
+**One claimer, not N.** If every executor ran its own claim query, the load on
+the hot path would scale with concurrency — and the claim query is the one thing
+every worker in the fleet contends on. A single claimer taking ten at a time
+keeps that contention flat as concurrency goes up.
+
+**Nothing busy-loops.** An idle claimer blocks on a three-way select: a NOTIFY
+wakeup, the poll timer, or shutdown.
+
+**Every job runs under `context.WithTimeout(ctx, job.VisibilityTimeout)`.** Past
+that deadline the reaper is entitled to hand the job to somebody else, so a
+handler still working past it is at best wasting effort and at worst about to
+become a second concurrent execution.
+
+**Panics are recovered per job.** A panicking handler is a bug in one job's
+code, not in the queue, and it must not stop the worker from running the other
+thousand. The stack goes into `last_error` — a panic with no stack is nearly
+useless to whoever has to fix it.
+
+### Retryable vs permanent errors
+
+The question is not "did it fail" but "would running it again plausibly give a
+different answer".
+
+- **Retryable** — a timeout, a 503 from an upstream, a deadlock. Nothing about
+  the job is wrong; the world was temporarily unhelpful. Full retry budget.
+- **Permanent** — the payload fails validation, or names a user that does not
+  exist. The next four attempts fail identically, so burning the budget on them
+  only delays the operator finding out. Handlers signal it with
+  `worker.Permanent(err)`, and the job goes straight to `dead`.
+
+One case that looks permanent and deliberately is not: **an unregistered kind**.
+During a rolling deploy the old workers do not yet have the handler for a kind
+the new code enqueues. Treating that as permanent would dead-letter every such
+job in the window between the first new enqueue and the last old worker going
+away. Retrying instead means the job waits and lands on a worker that knows what
+to do with it. If the kind really was a typo, it reaches the DLQ a few minutes
+later — a much cheaper mistake than the other direction.
+
+### Backoff
+
+`base * 2^attempt` capped at `max`, with **full jitter**: the exponential curve
+sets the ceiling and the actual delay is drawn uniformly from zero up to it.
+
+The jitter is not a nicety. The failure this queue is most likely to meet is a
+shared dependency going down, which fails every in-flight job at nearly the same
+instant. Pure exponential backoff schedules all of those retries for the same
+moment, so the recovering dependency is hit by the whole fleet at once, falls
+over again, and the herd re-forms — now synchronised more tightly than before.
+Spreading each retry across its window turns that spike into a flat arrival
+rate. Full jitter rather than the milder "half plus jitter" because nothing here
+cares whether one job waits 0.2s or 1.9s, and the herd protection is strictly
+better the wider the draw.
+
+### LISTEN/NOTIFY *and* polling
+
+Migration 0003 adds triggers that `pg_notify('jobs_pending')`. The insert
+trigger is **statement-level**, not row-level, which matters because
+`EnqueueMany` goes over `COPY` — a row-level trigger would emit 50,000
+notifications for one 50,000-row load. Retries and reclaims put existing rows
+back to `pending` without inserting, so they get a second, row-level trigger.
+
+The two mechanisms fail in opposite directions, which is exactly why you need
+both:
+
+| | polling | NOTIFY |
+| --- | --- | --- |
+| reliable? | yes — no state, survives any disconnect, cannot miss work | no — fire-and-forget, notifications sent while disconnected are simply gone |
+| fast? | no — latency and idle query load are one dial | yes — woken the instant the transaction commits, costs nothing idle |
+
+So NOTIFY collapses common-case latency from one poll interval to microseconds,
+and the poll timer underneath guarantees that a missed notification costs one
+interval of delay rather than a job that never runs. **The queue is correct
+because of the polling and fast because of the NOTIFY.**
+
+### Graceful shutdown
+
+`signal.NotifyContext` cancels one context; every shutdown decision hangs off
+that single cancellation.
+
+1. **The claimer stops immediately.** No new work from the moment the signal
+   lands.
+2. **Claimed-but-unstarted jobs are released straight back to `pending`.** They
+   have not run, so there is nothing to wait for.
+3. **In-flight jobs keep running** on a context that deliberately does *not*
+   inherit the cancellation, and get `DrainTimeout` (default 30s) to finish.
+4. **Anything still running at the deadline is cancelled and its job released
+   explicitly**, rather than left for the reaper. That turns a
+   visibility-timeout-long stall into an immediate handover.
+
+One subtlety worth naming: Go's `select` chooses at random when several cases
+are ready, so a plain two-case select would have let executors keep pulling
+buffered jobs after the signal for as long as the buffer lasted. The executors
+check cancellation in a non-blocking select first, so "stop taking new work"
+means what it says.
+
+Real output from `docker compose stop worker`, with 60 ten-second jobs in
+flight:
+
+```json
+{"level":"INFO","msg":"shutdown: released jobs back to pending","worker_id":"b73fa79b9431-1","count":2,"reason":"worker shut down before dispatch"}
+{"level":"INFO","msg":"shutdown: claimer stopped, draining in-flight jobs","worker_id":"b73fa79b9431-1"}
+{"level":"INFO","msg":"shutdown: releasing claimed-but-unstarted jobs","worker_id":"b73fa79b9431-1","count":10}
+{"level":"INFO","msg":"shutdown: released jobs back to pending","worker_id":"b73fa79b9431-1","count":10,"reason":"worker shut down before the job started"}
+{"level":"INFO","msg":"shutdown: all in-flight jobs finished","worker_id":"b73fa79b9431-1"}
+{"level":"INFO","msg":"shutdown complete","worker_id":"b73fa79b9431-1"}
+```
+
+Final state: 16 succeeded, 44 back in `pending`, **0 left in `claimed`**, all 60
+accounted for. The whole drain took 7.8s — the length of the longest job still
+running, not the 30s deadline.
+
+### The handlers
+
+`testdata/handlers` has six, each existing because some property needs a job
+that behaves that way: one that succeeds, one that always fails, one that fails
+twice then succeeds, one that runs past its visibility timeout, one that panics,
+and one that rejects its payload permanently.
+
+Note that the go tool skips `testdata/` when expanding `./...`, so that package
+is not built by `go build ./...`. It is compiled by the tests that import it.
 
 ## The claim query
 

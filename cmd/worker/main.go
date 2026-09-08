@@ -9,6 +9,8 @@ import (
 	"github.com/Sharvary-HH/queued/internal/config"
 	"github.com/Sharvary-HH/queued/internal/logging"
 	"github.com/Sharvary-HH/queued/internal/queue"
+	"github.com/Sharvary-HH/queued/internal/worker"
+	"github.com/Sharvary-HH/queued/testdata/handlers"
 )
 
 func main() {
@@ -23,8 +25,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := logging.New(cfg.LogLevel, "worker").With("worker_id", cfg.WorkerID)
+	log := logging.New(cfg.LogLevel, "worker")
 
+	// signal.NotifyContext is the whole of the signal handling: SIGTERM or
+	// SIGINT cancels ctx, and every shutdown decision downstream hangs off
+	// that one cancellation rather than off a signal channel being read in
+	// several places.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
@@ -34,17 +40,18 @@ func run() error {
 	}
 	defer pool.Close()
 
-	log.Info("worker up",
-		"queue", cfg.Queue,
-		"concurrency", cfg.Concurrency,
-		"claim_batch", cfg.ClaimBatch,
-		"poll_interval", cfg.PollInterval.String(),
-		"drain_timeout", cfg.DrainTimeout.String(),
-	)
+	reg := worker.NewRegistry()
+	// The demo handlers. A real deployment registers its own here; this is the
+	// only place in the project that knows what the jobs actually do.
+	handlers.NewSet().Register(reg)
 
-	// The pool itself is phase 3. Until then the process exists so that
-	// compose, the healthcheck and the shutdown path can be exercised.
-	<-ctx.Done()
-	log.Info("shutdown signal received")
-	return nil
+	w := worker.New(queue.NewStore(pool), reg, log, worker.Config{
+		Queue:        cfg.Queue,
+		WorkerID:     cfg.WorkerID,
+		Concurrency:  cfg.Concurrency,
+		ClaimBatch:   cfg.ClaimBatch,
+		PollInterval: cfg.PollInterval,
+		DrainTimeout: cfg.DrainTimeout,
+	})
+	return w.Run(ctx)
 }
