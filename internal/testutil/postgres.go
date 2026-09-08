@@ -88,6 +88,15 @@ func startContainer() (string, error) {
 // being measured.
 func DB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	pool, _ := DBWithDSN(t)
+	return pool
+}
+
+// DBWithDSN is DB plus the connection string, for tests that have to hand the
+// database to a separate process rather than use it in-process — the graceful
+// shutdown test runs the real worker binary and signals it.
+func DBWithDSN(t *testing.T) (*pgxpool.Pool, string) {
+	t.Helper()
 
 	base := admin(t)
 	name := fmt.Sprintf("queued_test_%d_%d", time.Now().UnixNano(), rand.IntN(100000))
@@ -134,7 +143,7 @@ func DB(t *testing.T) *pgxpool.Pool {
 		pool.Close()
 		dropDatabase(base, name)
 	})
-	return pool
+	return pool, dsn
 }
 
 func dropDatabase(base, name string) {

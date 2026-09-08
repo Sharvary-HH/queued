@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -37,9 +38,9 @@ const NotifyChannel = "jobs_pending"
 // rather than a job that never runs. The queue is correct because of the
 // polling and fast because of the NOTIFY.
 //
-// It also needs a dedicated connection — a connection inside LISTEN cannot be
-// handed back to the pool for query use — which is the other reason not to make
-// it load-bearing.
+// It also needs a connection of its own for the whole life of the process — a
+// connection inside LISTEN is blocked and cannot serve queries — which is one
+// more reason not to make it load-bearing.
 type listener struct {
 	pool    *pgxpool.Pool
 	log     *slog.Logger
@@ -92,20 +93,28 @@ func (l *listener) run(ctx context.Context) {
 	}
 }
 
+// listen opens its own connection rather than borrowing one from the query
+// pool, and that is not a stylistic preference.
+//
+// A LISTEN connection is held for the entire life of the process — it sits
+// blocked in WaitForNotification and is never given back. Taking it from the
+// query pool therefore permanently removes one connection from the pool, which
+// is survivable for a single worker and is not survivable in general: several
+// pools sharing one pgxpool will each take one and hold it, and once the number
+// of pools reaches MaxConns the pool is entirely consumed by listeners, no
+// claim query can ever acquire a connection, and the whole thing deadlocks with
+// no error anywhere. (Found exactly that way, by a test that ran twenty pools
+// against one pgxpool of fourteen.)
+//
+// Its own connection also means the query pool can be sized purely for queries,
+// and there is no risk of a connection that has been in LISTEN going back into
+// general rotation still carrying that state.
 func (l *listener) listen(ctx context.Context) error {
-	conn, err := l.pool.Acquire(ctx)
+	conn, err := pgx.ConnectConfig(ctx, l.pool.Config().ConnConfig)
 	if err != nil {
 		return err
 	}
-	// A connection that has been in LISTEN must not go back into general
-	// rotation still carrying that state, or some unrelated query ends up
-	// holding notifications nobody reads. Closing it makes pgxpool discard it
-	// on release; the cost is one reconnect on a path that only runs when the
-	// listener is restarting anyway.
-	defer func() {
-		_ = conn.Conn().Close(context.WithoutCancel(ctx))
-		conn.Release()
-	}()
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 
 	if _, err := conn.Exec(ctx, "LISTEN "+NotifyChannel); err != nil {
 		return err
@@ -116,7 +125,7 @@ func (l *listener) listen(ctx context.Context) error {
 		// Blocks until a notification arrives or ctx is done. Both a real
 		// connection failure and shutdown come back as an error here; run()
 		// tells them apart by looking at ctx.
-		if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
+		if _, err := conn.WaitForNotification(ctx); err != nil {
 			return err
 		}
 		l.signal()

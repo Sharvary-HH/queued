@@ -7,25 +7,56 @@ parked in a dead-letter queue when they will never succeed.
 
 ## Correctness properties
 
-These are the reasons the project exists. Each one gets a test in
-`internal/...` once the matching phase lands.
+These are the reasons the project exists, and each one is proven by a test in
+`internal/worker/properties_test.go` that runs against a real Postgres. Nothing
+is mocked: the guarantees are properties of Postgres row locking, and a fake
+would only prove that the fake agrees with itself.
 
-1. **No double execution under concurrency.** Two workers never claim the same
-   job.
-2. **No lost jobs on worker death.** A worker that dies mid-job has the job
-   reclaimed after its visibility timeout.
-3. **No lost jobs on graceful shutdown.** On SIGTERM the claimer stops, in-flight
-   jobs drain, anything still running at the deadline is released back to
-   `pending`.
-4. **Bounded retries.** A job that keeps failing lands in the DLQ after exactly
-   `max_attempts`.
-5. **At-least-once, not exactly-once.** Handlers must be idempotent.
+| # | property | proven by | how |
+| --- | --- | --- | --- |
+| 1 | **No double execution under concurrency** | `TestProperty1_NoDoubleExecutionUnderConcurrency` | 1000 jobs, 20 independent pools with their own worker IDs and claimers. Asserts every job ran, the handler was entered exactly 1000 times (counted in Go, independent of the database), `job_attempts` holds no duplicate `(job_id, attempt)` pair, and there are exactly 1000 attempt rows. Also passes under `-race -count=10`. |
+| 2 | **No lost jobs on worker death** | `TestProperty2_NoLostJobsOnWorkerDeath` | Claims a job and never reports — indistinguishable from SIGKILL as far as the database is concerned. Checks nobody else can touch it before the timeout, then that the reaper returns it, another worker runs it, and *both* attempts survive in the history. |
+| 3 | **No lost jobs on graceful shutdown** | `TestProperty3_RealSIGTERMDrainsInFlightJobs` | Builds `cmd/worker`, runs it as a real process, and sends it a real `SIGTERM` one second into four 5-second jobs. Asserts it exits 0, all four succeeded, none stranded in `claimed`, and the drain took about as long as the work — not the 30s deadline. |
+| 4 | **Bounded retries** | `TestProperty4_BoundedRetries` | A job that can never succeed runs exactly `max_attempts` times and no more, then sits in `dead` with its reason recorded. |
+| 5 | **At-least-once, not exactly-once** | `TestProperty5_AtLeastOnceIsObservable` | Proves the *negative*: a handler that ignores its context is caught running twice concurrently on the same job. This is the contract, not a bug. |
+| — | **Idempotency key dedupes** | `TestPropertyIdempotencyKeyCreatesOneJob` | Five enqueues with one key produce one row and one execution. |
+
+Property 3 is tested against the real binary rather than a cancelled context on
+purpose. Between "the pool drains when its context is cancelled" and "sending
+SIGTERM to a worker is safe" sit `signal.NotifyContext`, the process exit path,
+and whether the binary is wired up the way the pool expects — none of which a
+cancelled context exercises.
+
+### Why exactly-once is not on offer
+
+A handler runs, and then its result is written to Postgres. Those are two
+separate steps, and the worker can die in between: the work is done and nothing
+records it, so the job is retried and the work happens twice. Closing that gap
+would mean the handler's side effect and the queue's bookkeeping committing
+together in one transaction — possible only if the side effect *is* a write to
+the same database, which rules out sending an email, charging a card, or calling
+anyone else's API. For everything else the choice is at-least-once or
+at-most-once, and at-most-once means silently dropping work.
+
+So: **handlers must be idempotent.** Give the work a natural key and make the
+second execution a no-op — `INSERT ... ON CONFLICT DO NOTHING` on a
+`(job_id, side_effect)` row, or an idempotency key on the upstream API. The
+queue helps by making retries visible and bounded, not by pretending they cannot
+happen.
 
 ## Status
 
-Phases 0–4 are done: scaffold, schema, the claim query, the worker pool, and
-retries/DLQ/reaper. Everything else is marked in the source with the phase that
-fills it in.
+Phases 0–5 are done: scaffold, schema, the claim query, the worker pool,
+retries/DLQ/reaper, and the correctness suite. Still to come: the cron
+scheduler, the HTTP API and dashboard, benchmarks, and deployment docs.
+
+```
+make race     # go test -race ./...   — the gate on every phase
+make test
+```
+
+51 tests, all against a real Postgres started by testcontainers. Green under
+`-race` at `-count=3`; property 1 also at `-count=10`.
 
 ## The reaper
 
@@ -89,18 +120,27 @@ alongside it. Cancelling locally means the slot comes back and there is only one
 execution in flight. The reaper is the backstop for the case the pool cannot
 handle — a process that is simply gone.
 
-### Connection pool sizing
+### Connection pool sizing, and the LISTEN connection
 
 pgx defaults `MaxConns` to `max(4, numCPU)`. A worker needs one connection per
-executor reporting a result, plus the claimer, plus the reaper, plus one the
-NOTIFY listener holds for its entire life and never gives back. At the default
-`CONCURRENCY=8` that is eleven consumers sharing eight connections; on a
-four-core box with `CONCURRENCY=32` it would be thirty-five sharing four.
+executor reporting a result, plus the claimer, plus the reaper. At the default
+`CONCURRENCY=8` that is ten consumers sharing eight connections; on a four-core
+box with `CONCURRENCY=32` it would be thirty-four sharing four. Nothing errors —
+pgx just queues — so the symptom is everything getting slower under load, which
+is a miserable thing to debug. The worker sizes its pool as `CONCURRENCY + 4`,
+overridable with `DB_MAX_CONNS`.
 
-Nothing errors when this happens — pgx just queues — so the symptom is not a
-failure but everything getting slower under load, which is a miserable thing to
-debug. The worker therefore sizes its pool as `CONCURRENCY + 4`, overridable
-with `DB_MAX_CONNS`.
+The NOTIFY listener is deliberately **not** in that count: it opens its own
+connection instead of borrowing one from the pool. A `LISTEN` connection is held
+for the entire life of the process — it sits blocked in `WaitForNotification`
+and is never given back — so taking it from the query pool permanently removes
+one connection. That is survivable for a single worker and not survivable in
+general: N pools sharing one pgxpool each take one and hold it, and once N
+reaches `MaxConns` the pool is *entirely* consumed by listeners, no claim query
+can ever acquire a connection, and everything deadlocks with no error anywhere.
+
+That is not hypothetical. The property-1 test runs twenty pools against one
+pgxpool of fourteen, and it hung until the listener got its own connection.
 
 ### Requeue resets `attempt` to 0
 

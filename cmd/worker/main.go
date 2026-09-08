@@ -35,10 +35,11 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// One connection per executor reporting a result, plus the claimer, the
-	// reaper, and the one the NOTIFY listener holds for its whole life. Sizing
-	// this off Concurrency rather than taking pgx's numCPU default is what stops
-	// a high-concurrency worker from quietly queueing on connection acquisition.
+	// One connection per executor reporting a result, plus the claimer and the
+	// reaper, plus headroom. (The NOTIFY listener is not in this count: it opens
+	// its own connection precisely so it cannot eat the query pool.) Sizing off
+	// Concurrency rather than taking pgx's numCPU default is what stops a
+	// high-concurrency worker from quietly queueing on connection acquisition.
 	maxConns := cfg.DBMaxConns
 	if maxConns == 0 {
 		maxConns = cfg.Concurrency + 4
