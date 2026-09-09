@@ -1,0 +1,54 @@
+{{define "content"}}
+<h1>Jobs</h1>
+
+<form class="filters" method="get" action="/jobs">
+  <select name="state">
+    <option value="">any state</option>
+    {{range .States}}<option value="{{.}}" {{if eq $.Filter.State .}}selected{{end}}>{{.}}</option>{{end}}
+  </select>
+  <select name="queue">
+    <option value="">any queue</option>
+    {{range .Queues}}<option value="{{.}}" {{if eq $.Filter.Queue .}}selected{{end}}>{{.}}</option>{{end}}
+  </select>
+  <select name="kind">
+    <option value="">any kind</option>
+    {{range .Kinds}}<option value="{{.}}" {{if eq $.Filter.Kind .}}selected{{end}}>{{.}}</option>{{end}}
+  </select>
+  <button type="submit">Filter</button>
+  <a class="btn-link" href="/jobs">Reset</a>
+</form>
+
+{{template "jobtable" .}}
+{{end}}
+
+{{define "jobtable"}}
+<table>
+  <thead>
+    <tr><th>ID</th><th>Kind</th><th>Queue</th><th>State</th><th class="num">Attempt</th>
+        <th>Run at</th><th>Last error</th><th></th></tr>
+  </thead>
+  <tbody>
+  {{range .Jobs}}
+    <tr>
+      <td><a href="/jobs/{{.ID}}">{{.ID}}</a></td>
+      <td>{{.Kind}}</td>
+      <td>{{.Queue}}</td>
+      <td><span class="pill s-{{.State}}">{{.State}}</span></td>
+      <td class="num">{{.Attempt}}/{{.MaxAttempts}}</td>
+      <td title="{{time .RunAt}}">{{time .RunAt}}</td>
+      <td class="err">{{truncate 70 (str .LastError)}}</td>
+      <td>
+        {{if eq .State "pending"}}
+        <form method="post" action="/jobs/{{.ID}}/cancel" class="inline">
+          <button class="small">Cancel</button>
+        </form>
+        {{end}}
+      </td>
+    </tr>
+  {{else}}
+    <tr><td colspan="8" class="muted">Nothing here.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{if .Next}}<p><a class="btn-link" href="?before={{.Next}}{{if .Filter.State}}&state={{.Filter.State}}{{end}}{{if .Filter.Queue}}&queue={{.Filter.Queue}}{{end}}{{if .Filter.Kind}}&kind={{.Filter.Kind}}{{end}}">Older →</a></p>{{end}}
+{{end}}

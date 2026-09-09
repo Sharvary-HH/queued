@@ -1,0 +1,28 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{.Title}} · queued</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="/">queued</a>
+  <nav>
+    <a href="/"          class="{{if eq .Nav "overview"}}on{{end}}">Overview</a>
+    <a href="/jobs"      class="{{if eq .Nav "jobs"}}on{{end}}">Jobs</a>
+    <a href="/dead"      class="{{if eq .Nav "dead"}}on{{end}}">Dead letter</a>
+    <a href="/recurring" class="{{if eq .Nav "recurring"}}on{{end}}">Recurring</a>
+  </nav>
+  <span class="spacer"></span>
+  <label class="refresh"><input type="checkbox" id="auto" checked> auto-refresh</label>
+</header>
+<main>
+{{if .Flash}}<p class="flash">{{.Flash}}</p>{{end}}
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+{{template "content" .}}
+</main>
+<script src="/static/refresh.js"></script>
+</body>
+</html>{{end}}

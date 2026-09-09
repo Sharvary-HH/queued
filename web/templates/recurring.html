@@ -1,0 +1,29 @@
+{{define "content"}}
+<h1>Recurring jobs</h1>
+
+<table>
+  <thead><tr><th>Name</th><th>Cron</th><th>Kind</th><th>Queue</th><th>Last run</th><th>Next run</th><th>State</th><th></th></tr></thead>
+  <tbody>
+  {{range .Cron}}
+    <tr class="{{if not .Enabled}}dim{{end}}">
+      <td>{{.Name}}</td>
+      <td><code>{{.Cron}}</code></td>
+      <td>{{.Kind}}</td>
+      <td>{{.Queue}}</td>
+      <td>{{timep .LastRunAt}}</td>
+      <td>{{time .NextRunAt}}{{if .Enabled}} <span class="muted">(in {{until .NextRunAt}})</span>{{end}}</td>
+      <td>{{if .Enabled}}<span class="pill s-succeeded">enabled</span>{{else}}<span class="pill s-cancelled">disabled</span>{{end}}</td>
+      <td>
+        <form method="post" action="/recurring/{{.ID}}/toggle" class="inline">
+          <input type="hidden" name="enabled" value="{{if .Enabled}}false{{else}}true{{end}}">
+          <button class="small">{{if .Enabled}}Disable{{else}}Enable{{end}}</button>
+        </form>
+      </td>
+    </tr>
+  {{else}}
+    <tr><td colspan="8" class="muted">No schedules registered.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+<p class="muted">Register one with <code>enqueue -kind &lt;kind&gt; -cron '*/5 * * * *' -name &lt;name&gt;</code> or <code>POST /api/recurring</code>.</p>
+{{end}}

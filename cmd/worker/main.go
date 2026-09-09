@@ -2,17 +2,34 @@ package main
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/Sharvary-HH/queued/internal/config"
 	"github.com/Sharvary-HH/queued/internal/logging"
 	"github.com/Sharvary-HH/queued/internal/queue"
 	"github.com/Sharvary-HH/queued/internal/worker"
 	"github.com/Sharvary-HH/queued/testdata/handlers"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// workerRoutes is deliberately tiny: a worker is not a web service, it just has
+// to be scrapeable and to answer a liveness probe.
+func workerRoutes() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	return mux
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -67,6 +84,30 @@ func run() error {
 	go func() {
 		defer reaperDone.Done()
 		worker.NewReaper(store, log, worker.ReaperConfig{Interval: cfg.ReapInterval}).Run(ctx)
+	}()
+
+	// Workers record jobs_completed_total, job_duration_seconds and
+	// worker_pool_active, and none of it is worth anything if nothing can scrape
+	// it. The queued server's /metrics only knows what that process did, so the
+	// numbers that matter most — how long handlers take, how many are running —
+	// would be invisible without this.
+	metricsSrv := &http.Server{
+		Addr:              cfg.WorkerHTTPAddr,
+		Handler:           workerRoutes(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		log.Info("worker metrics listening", "addr", cfg.WorkerHTTPAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Not fatal: a worker that cannot serve metrics should still run
+			// jobs. Losing observability is bad; refusing to work is worse.
+			log.Error("worker metrics server stopped", "error", err)
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
 
 	w := worker.New(store, reg, log, worker.Config{

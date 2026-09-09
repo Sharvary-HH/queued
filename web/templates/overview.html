@@ -1,0 +1,44 @@
+{{define "content"}}
+<h1>Overview</h1>
+
+<section class="tiles">
+  {{range $state, $count := .Totals}}
+  <a class="tile s-{{$state}}" href="/jobs?state={{$state}}">
+    <span class="n">{{$count}}</span>
+    <span class="l">{{$state}}</span>
+  </a>
+  {{end}}
+</section>
+
+<h2>Throughput, last hour</h2>
+{{if .Points}}
+<div class="chart">
+  {{range .Points}}
+  <div class="bar" title="{{.Minute}} — {{.Succeeded}} ok, {{.Failed}} failed">
+    <div class="ok"   style="height:{{pct .Succeeded $.MaxPoint}}%"></div>
+    <div class="bad"  style="height:{{pct .Failed $.MaxPoint}}%"></div>
+    <span class="t">{{.Minute}}</span>
+  </div>
+  {{end}}
+</div>
+<p class="muted">Attempts that finished, by minute. Peak {{.MaxPoint}}/min.</p>
+{{else}}
+<p class="muted">No attempts finished in the last hour.</p>
+{{end}}
+
+<h2>By queue</h2>
+<table>
+  <thead><tr><th>Queue</th><th>State</th><th class="num">Jobs</th></tr></thead>
+  <tbody>
+  {{range .Stats}}
+    <tr>
+      <td>{{.Queue}}</td>
+      <td><span class="pill s-{{.State}}">{{.State}}</span></td>
+      <td class="num">{{.Count}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="3" class="muted">No jobs yet.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}

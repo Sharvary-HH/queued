@@ -28,6 +28,8 @@ func main() {
 	flag.DurationVar(&opts.visibility, "visibility-timeout", 0, "how long a claim is honoured")
 	flag.StringVar(&opts.cron, "cron", "", "register a recurring schedule instead of a single job")
 	flag.StringVar(&opts.name, "name", "", "name of the recurring schedule (required with -cron)")
+	flag.IntVar(&opts.rate, "rate", 0, "with -for: jobs per second to sustain")
+	flag.DurationVar(&opts.duration, "for", 0, "keep enqueuing for this long (load generator)")
 	flag.Parse()
 
 	if err := run(opts); err != nil {
@@ -48,6 +50,54 @@ type options struct {
 	visibility  time.Duration
 	cron        string
 	name        string
+	rate        int
+	duration    time.Duration
+}
+
+// generate is the load generator: a steady trickle rather than one enormous
+// dump, so the dashboard shows a queue being worked rather than a spike that is
+// gone before anyone looks.
+func generate(ctx context.Context, store *queue.Store, params queue.EnqueueParams, opts options) error {
+	rate := opts.rate
+	if rate < 1 {
+		rate = 50
+	}
+
+	// One batch per tick, ten ticks a second. Enqueueing one row at a time at
+	// any real rate spends all its time on round trips.
+	const ticksPerSecond = 10
+	perTick := max(1, rate/ticksPerSecond)
+
+	batch := make([]queue.EnqueueParams, perTick)
+	for i := range batch {
+		batch[i] = params
+	}
+
+	ticker := time.NewTicker(time.Second / ticksPerSecond)
+	defer ticker.Stop()
+	deadline := time.After(opts.duration)
+
+	var total int64
+	start := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline:
+			fmt.Printf("enqueued %d jobs over %s (%.0f/sec)\n",
+				total, time.Since(start).Round(time.Second), float64(total)/time.Since(start).Seconds())
+			return nil
+		case <-ticker.C:
+			n, err := store.EnqueueMany(ctx, batch)
+			if err != nil {
+				return err
+			}
+			total += n
+			if total%(int64(rate)*10) < int64(perTick) {
+				fmt.Printf("%d jobs enqueued (%.0f/sec)\n", total, float64(total)/time.Since(start).Seconds())
+			}
+		}
+	}
 }
 
 func run(opts options) error {
@@ -70,7 +120,13 @@ func run(opts options) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// The load generator can be asked to run for a long time; everything else
+	// is a single statement and wants a short leash.
+	timeout := 5 * time.Minute
+	if opts.duration > 0 {
+		timeout = opts.duration + time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	pool, err := queue.Connect(ctx, cfg.DatabaseURL, 2)
@@ -120,6 +176,10 @@ func run(opts options) error {
 	}
 	if opts.key != "" {
 		params.IdempotencyKey = &opts.key
+	}
+
+	if opts.duration > 0 {
+		return generate(ctx, store, params, opts)
 	}
 
 	// One job goes through Enqueue so the idempotency key is honoured; a batch

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Sharvary-HH/queued/internal/metrics"
 )
 
 // EnqueueParams describes a job to submit. Only Kind is required; the zero
@@ -109,6 +111,7 @@ func (s *Store) Enqueue(ctx context.Context, p EnqueueParams) (Job, bool, error)
 		nullableTime(p.RunAt), p.MaxAttempts, visibility, p.IdempotencyKey,
 	))
 	if err == nil {
+		metrics.JobsEnqueued.WithLabelValues(job.Queue, job.Kind).Inc()
 		return job, true, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -200,6 +203,13 @@ func (s *Store) EnqueueMany(ctx context.Context, params []EnqueueParams) (int64,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("enqueue many: %w", err)
+	}
+	for _, p := range params {
+		q := p.Queue
+		if q == "" {
+			q = defaultQueue
+		}
+		metrics.JobsEnqueued.WithLabelValues(q, p.Kind).Inc()
 	}
 	return n, nil
 }

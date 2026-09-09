@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Sharvary-HH/queued/internal/metrics"
 	"github.com/Sharvary-HH/queued/internal/queue"
 )
 
@@ -298,9 +299,11 @@ func (p *Pool) runJob(ctx context.Context, log *slog.Logger, job queue.Job) {
 	jobCtx, cancel := context.WithTimeout(ctx, job.VisibilityTimeout)
 	defer cancel()
 
+	metrics.WorkerPoolActive.WithLabelValues(p.cfg.WorkerID, p.cfg.Queue).Inc()
 	start := time.Now()
 	err = safely(handler)(jobCtx, job.Payload)
 	elapsed := time.Since(start)
+	metrics.WorkerPoolActive.WithLabelValues(p.cfg.WorkerID, p.cfg.Queue).Dec()
 
 	// Reporting gets a context of its own. If the handler was cancelled by the
 	// drain deadline, the executor context is already dead, and a job whose
@@ -320,6 +323,7 @@ func (p *Pool) runJob(ctx context.Context, log *slog.Logger, job queue.Job) {
 		p.logReportFailure(log, cerr, "complete")
 		return
 	}
+	metrics.ObserveJob(job.Kind, "succeeded", elapsed.Seconds())
 	log.Info("job succeeded", "duration_ms", elapsed.Milliseconds())
 }
 
@@ -340,11 +344,16 @@ func (p *Pool) report(ctx context.Context, log *slog.Logger, job queue.Job, caus
 		return
 	}
 
+	// "dead" and "failed" are counted apart on purpose: one is a job that will
+	// be retried, the other is one nobody will look at again unless a human
+	// does. Only the second is worth alerting on.
 	if state == queue.StateDead {
+		metrics.JobsCompleted.WithLabelValues(job.Kind, "dead").Inc()
 		log.Error("job moved to dead-letter queue",
 			"reason", deadReason(permanent), "attempts_used", job.Attempt, "error", cause)
 		return
 	}
+	metrics.JobsCompleted.WithLabelValues(job.Kind, "failed").Inc()
 	log.Info("job scheduled for retry", "next_attempt", job.Attempt+1, "of", job.MaxAttempts)
 }
 

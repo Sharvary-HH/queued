@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/robfig/cron/v3"
 
+	"github.com/Sharvary-HH/queued/internal/metrics"
 	"github.com/Sharvary-HH/queued/internal/queue"
 )
 
@@ -157,7 +158,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 		}
 
 		s.log.Info("became scheduler leader")
+		metrics.SchedulerLeader.Set(1)
 		s.lead(ctx, conn)
+		metrics.SchedulerLeader.Set(0)
 		s.log.Info("no longer scheduler leader")
 
 		// Closing the connection releases the advisory lock, so a leader that

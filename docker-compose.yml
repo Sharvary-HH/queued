@@ -50,5 +50,19 @@ services:
       replicas: 3
     stop_grace_period: 40s
 
+  # Not started by default. `docker compose --profile load up loadgen` (or
+  # `make loadgen` from the host) turns it on when you want the dashboard to
+  # have something moving on it.
+  loadgen:
+    build: .
+    entrypoint: ["/enqueue"]
+    command: ["-kind", "succeed", "-rate", "200", "-for", "60m"]
+    profiles: ["load"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://queued:queued@postgres:5432/queued?sslmode=disable
+
 volumes:
   pgdata:

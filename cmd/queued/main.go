@@ -89,9 +89,19 @@ func run() error {
 
 	defer background.Wait()
 
+	apiServer := api.NewServer(store, log)
+
+	// Queue-depth gauges come from one aggregate query on a timer, shared with
+	// the dashboard, rather than being recomputed per scrape or per page view.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		apiServer.RefreshStats(ctx, 10*time.Second)
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewServer(store, log).Routes(),
+		Handler:           apiServer.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

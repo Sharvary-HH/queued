@@ -1,0 +1,18 @@
+-- Cancelling a pending job needs a state to put it in.
+--
+-- The alternatives were worse. Deleting the row loses the record that the job
+-- ever existed, which is the one thing an operator asks about afterwards
+-- ("did that send?"). Reusing 'dead' conflates "we tried five times and gave
+-- up" with "somebody changed their mind before it ran", and those want
+-- different answers on the dashboard and different alerting.
+--
+-- The 'failed' value from the original enum is still unused: a failed attempt
+-- with retries left goes back to 'pending' with run_at pushed out, and one
+-- without goes to 'dead', so no job is ever in between. It is kept rather than
+-- dropped because dropping an enum value means rewriting the type, and it
+-- costs nothing to leave.
+--
+-- ADD VALUE inside a transaction is fine on Postgres 12 and later as long as
+-- the new value is not *used* in the same transaction. This migration only
+-- declares it; the code starts writing it afterwards.
+ALTER TYPE job_state ADD VALUE IF NOT EXISTS 'cancelled';

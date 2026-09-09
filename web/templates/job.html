@@ -1,0 +1,59 @@
+{{define "content"}}
+{{with .Job}}
+<h1>Job {{.ID}} <span class="pill s-{{.State}}">{{.State}}</span></h1>
+
+<table class="kv">
+  <tr><th>Kind</th><td>{{.Kind}}</td></tr>
+  <tr><th>Queue</th><td>{{.Queue}}</td></tr>
+  <tr><th>Priority</th><td>{{.Priority}}</td></tr>
+  <tr><th>Attempt</th><td>{{.Attempt}} of {{.MaxAttempts}}</td></tr>
+  <tr><th>Run at</th><td>{{time .RunAt}}</td></tr>
+  <tr><th>Claimed by</th><td>{{if .ClaimedBy}}{{str .ClaimedBy}}{{else}}—{{end}}</td></tr>
+  <tr><th>Claim expires</th><td>{{timep .ClaimExpiresAt}}</td></tr>
+  <tr><th>Visibility timeout</th><td>{{.VisibilityTimeout}}</td></tr>
+  <tr><th>Idempotency key</th><td>{{if .IdempotencyKey}}<code>{{str .IdempotencyKey}}</code>{{else}}—{{end}}</td></tr>
+  <tr><th>Created</th><td>{{time .CreatedAt}} ({{since .CreatedAt}} ago)</td></tr>
+  <tr><th>Updated</th><td>{{time .UpdatedAt}}</td></tr>
+</table>
+
+<h2>Payload</h2>
+<pre class="payload">{{json .Payload}}</pre>
+
+{{if .LastError}}
+<h2>Last error</h2>
+<pre class="err-box">{{str .LastError}}</pre>
+{{end}}
+
+<p class="actions">
+  {{if eq .State "dead"}}
+  <form method="post" action="/jobs/{{.ID}}/requeue" class="inline">
+    <button>Requeue</button>
+  </form>
+  {{end}}
+  {{if eq .State "pending"}}
+  <form method="post" action="/jobs/{{.ID}}/cancel" class="inline">
+    <button>Cancel</button>
+  </form>
+  {{end}}
+</p>
+{{end}}
+
+<h2>Attempt history</h2>
+<table>
+  <thead><tr><th class="num">#</th><th>Worker</th><th>Started</th><th>Finished</th><th>Took</th><th>Error</th></tr></thead>
+  <tbody>
+  {{range .Attempts}}
+    <tr>
+      <td class="num">{{.Attempt}}</td>
+      <td><code>{{.WorkerID}}</code></td>
+      <td>{{time .StartedAt}}</td>
+      <td>{{timep .FinishedAt}}</td>
+      <td>{{duration .StartedAt .FinishedAt}}</td>
+      <td class="err">{{truncate 90 (str .Error)}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="6" class="muted">Never claimed.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}

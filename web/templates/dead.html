@@ -1,0 +1,28 @@
+{{define "content"}}
+<h1>Dead letter queue</h1>
+<p class="muted">Jobs that used every attempt, or failed permanently. Requeue resets the attempt counter to zero.</p>
+
+<table>
+  <thead><tr><th>ID</th><th>Kind</th><th>Queue</th><th class="num">Attempts</th><th>Failed</th><th>Last error</th><th></th></tr></thead>
+  <tbody>
+  {{range .Jobs}}
+    <tr>
+      <td><a href="/jobs/{{.ID}}">{{.ID}}</a></td>
+      <td>{{.Kind}}</td>
+      <td>{{.Queue}}</td>
+      <td class="num">{{.Attempt}}</td>
+      <td>{{since .UpdatedAt}} ago</td>
+      <td class="err">{{truncate 70 (str .LastError)}}</td>
+      <td>
+        <form method="post" action="/jobs/{{.ID}}/requeue" class="inline">
+          <button class="small">Requeue</button>
+        </form>
+      </td>
+    </tr>
+  {{else}}
+    <tr><td colspan="7" class="muted">Empty — nothing has given up.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{if .Next}}<p><a class="btn-link" href="?before={{.Next}}">Older →</a></p>{{end}}
+{{end}}

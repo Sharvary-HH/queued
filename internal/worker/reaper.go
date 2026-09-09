@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Sharvary-HH/queued/internal/metrics"
 	"github.com/Sharvary-HH/queued/internal/queue"
 )
 
@@ -98,6 +99,7 @@ func (r *Reaper) sweep(ctx context.Context) {
 		}
 
 		for _, job := range reclaimed {
+			metrics.JobsReclaimed.WithLabelValues(string(job.State)).Inc()
 			// Every reclaim is logged individually and at warn, because a
 			// reclaim is never normal. It means a worker died holding this job,
 			// or a handler ran past its visibility timeout. Either way somebody

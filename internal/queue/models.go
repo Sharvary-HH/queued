@@ -21,11 +21,15 @@ const (
 	StateFailed State = "failed"
 
 	StateDead State = "dead"
+
+	// StateCancelled is an operator stopping a job before it ran. Added in
+	// migration 0004; see the note there for why it is not just 'dead'.
+	StateCancelled State = "cancelled"
 )
 
 func (s State) Valid() bool {
 	switch s {
-	case StatePending, StateClaimed, StateSucceeded, StateFailed, StateDead:
+	case StatePending, StateClaimed, StateSucceeded, StateFailed, StateDead, StateCancelled:
 		return true
 	}
 	return false

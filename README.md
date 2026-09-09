@@ -46,17 +46,90 @@ happen.
 
 ## Status
 
-Phases 0–6 are done: scaffold, schema, the claim query, the worker pool,
-retries/DLQ/reaper, the correctness suite, and the cron scheduler. Still to
-come: the HTTP API and dashboard, benchmarks, and deployment docs.
+All nine phases are implemented. Phase 8's *numbers* are the one gap — see
+[Benchmarks](#benchmarks).
 
 ```
-make race     # go test -race ./...   — the gate on every phase
-make test
+make up       # postgres + queued + 3 workers
+make seed     # a mixed backlog to look at
+make race     # go test -race ./...  — the gate on every phase
 ```
 
 58 tests, all against a real Postgres started by testcontainers. Green under
 `-race` at `-count=3`; property 1 also at `-count=10`.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph clients[" "]
+    API["POST /api/jobs"]
+    CLI["enqueue CLI<br/>(COPY, bulk)"]
+  end
+
+  subgraph pg["Postgres 16 — the only stateful thing"]
+    JOBS[("jobs")]
+    ATT[("job_attempts")]
+    REC[("recurring_jobs")]
+  end
+
+  subgraph queued["queued (N instances)"]
+    HTTP["API + dashboard"]
+    SCHED["scheduler<br/>advisory-lock leader"]
+    REAP1["reaper"]
+  end
+
+  subgraph workers["worker (N processes)"]
+    CLAIM["claimer<br/>batch of 10"]
+    EXEC["N executors"]
+    REAP2["reaper"]
+    LISTEN["LISTEN jobs_pending"]
+  end
+
+  API --> JOBS
+  CLI --> JOBS
+  REC -->|"CAS on next_run_at"| SCHED --> JOBS
+  JOBS -->|"FOR UPDATE SKIP LOCKED"| CLAIM --> EXEC
+  EXEC -->|"complete / fail"| JOBS
+  EXEC --> ATT
+  JOBS -.->|"NOTIFY on commit"| LISTEN -.->|wake| CLAIM
+  REAP1 -->|"expired claims"| JOBS
+  REAP2 -->|"expired claims"| JOBS
+  HTTP --> JOBS
+  HTTP --> ATT
+  HTTP --> REC
+```
+
+Nothing talks to anything but Postgres. There is no worker registry, no
+heartbeat, no coordination protocol, and no service discovery: workers find work
+by running a query, and the only thing they share is a table.
+
+## Job state machine
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending: enqueue
+  pending --> claimed: claim query<br/>(attempt += 1)
+  claimed --> succeeded: handler returned nil
+  claimed --> pending: handler failed,<br/>run_at = now + backoff
+  claimed --> dead: attempt >= max_attempts<br/>or permanent error
+  claimed --> pending: reaper — claim expired
+  claimed --> dead: reaper — claim expired<br/>and attempts spent
+  claimed --> pending: shutdown release
+  pending --> cancelled: operator
+  dead --> pending: requeue<br/>(attempt = 0)
+  succeeded --> [*]
+  cancelled --> [*]
+```
+
+Two things worth reading off that diagram:
+
+- **`attempt` increments on the `pending → claimed` edge**, not on failure. That
+  is why a worker that dies silently still burns an attempt, and why the reaper
+  has a `claimed → dead` edge at all.
+- **There is no `failed` state**, though the enum has the value. A failed attempt
+  with retries left goes back to `pending`; one without goes to `dead`. There is
+  no moment in between for a job to occupy.
 
 ## The scheduler
 
@@ -613,16 +686,193 @@ The two things to look for:
 Warm repeats land at **0.8–1.1 ms execution**. The 4 ms above is the first,
 cold run, and roughly 0.5 ms of it is the `updated_at` trigger.
 
+## API and dashboard
+
+`internal/api`, stdlib `net/http` with Go 1.22 routing patterns — method and
+wildcards live in the pattern itself, so there is no router dependency and no
+hand-rolled method switch in every handler.
+
+| method | path | |
+| --- | --- | --- |
+| `POST` | `/api/jobs` | enqueue; 201 for a new job, 200 when an idempotency key matched |
+| `GET` | `/api/jobs` | list, filtered by `state`/`queue`/`kind`, keyset paginated |
+| `GET` | `/api/jobs/{id}` | one job with its full attempt history |
+| `POST` | `/api/jobs/{id}/requeue` | move a dead job back to pending |
+| `POST` | `/api/jobs/{id}/cancel` | cancel a pending job |
+| `GET` | `/api/stats` | counts by queue and state |
+| `GET` | `/api/recurring` | list schedules |
+| `POST` | `/api/recurring` | create or replace a schedule |
+| `POST` | `/api/recurring/{id}/enabled` | enable or disable |
+| `GET` | `/healthz` `/readyz` `/metrics` | probes and Prometheus |
+
+`/healthz` deliberately does **not** touch the database. Liveness failing gets
+the process restarted, and restarting every instance is precisely the wrong
+response to Postgres being unwell. `/readyz` does check, because a process that
+cannot reach the database cannot serve.
+
+**Pagination is keyset, not `OFFSET`.** `OFFSET` makes the database walk and
+discard every row it skips, so page 500 costs five hundred times page 1 — and on
+a table being inserted into while you page, the offsets shift underneath you and
+rows are silently skipped and repeated.
+
+The dashboard is server-rendered `html/template`: overview with counts and a
+throughput chart, a filterable job list, job detail with the full attempt
+history, the dead-letter queue with requeue buttons, and the schedules with
+enable/disable. No SPA, no build step. Auto-refresh is a few lines of vanilla JS
+that reloads only while the tab is visible — a dashboard forgotten in a
+background tab should not keep querying the database all weekend.
+
+One bug worth recording, because it failed silently: every page file defines a
+`content` block, and parsing them all into one template set means the last file
+alphabetically wins for *all* of them. Every page rendered the recurring-jobs
+page, with a 200 and no error anywhere. Each page now gets its own set.
+
+## Metrics
+
+Both binaries expose `/metrics` — `queued` on `:8080`, each worker on `:8081`.
+Workers need their own endpoint because `jobs_completed_total`,
+`job_duration_seconds` and `worker_pool_active` only exist in the worker
+process, and the server's endpoint only knows what the server did.
+
+| metric | type | |
+| --- | --- | --- |
+| `jobs_enqueued_total{queue,kind}` | counter | |
+| `jobs_completed_total{kind,status}` | counter | status is `succeeded`/`failed`/`dead` — "will retry" and "gave up" are different alerts |
+| `job_duration_seconds{kind}` | histogram | handler execution |
+| `job_queue_depth{queue,state}` | gauge | refreshed on a timer, shared with the dashboard |
+| `job_claim_latency_seconds` | histogram | the claim query itself |
+| `jobs_reclaimed_total{returned_to}` | counter | **the health signal** |
+| `worker_pool_active{worker_id,queue}` | gauge | |
+| `scheduler_is_leader` | gauge | 1 on the instance holding the lock |
+
+**`jobs_reclaimed_total` is the one to alert on.** Everything else here can be
+busy for good reasons. A reclaim means a worker died holding a job or a handler
+outran its visibility timeout, and on a healthy system it is flat at zero.
+
+The depth gauges are `Reset()` before each refresh: a Prometheus gauge vector
+keeps exporting a label pair that stops being reported, so a queue that drains
+would otherwise export its last non-zero depth forever and keep every alert on
+it lit.
+
+Logging is `log/slog`, JSON to stdout, with `job_id`, `kind`, `attempt` and
+`worker_id` on every line that has them.
+
+## Benchmarks
+
+The harness is `internal/bench`, behind a `bench` build tag so it cannot run
+during `go test ./...`:
+
+```
+make up && make bench
+```
+
+It measures throughput at 1/4/16/64 workers with a no-op handler, claim
+p50/p95/p99 at each level, batched-vs-single claim, and the claim query at a
+depth of 1M rows with `EXPLAIN ANALYZE` on both sides. It runs against the
+compose Postgres rather than the test container, because that container has
+`fsync=off` — which roughly doubles write throughput and would make every number
+a lie.
+
+**The numbers are not in this README yet, and I am not going to invent them.**
+The machine this was built on ran out of disk (Docker's VM image is 15 GB and
+the host had under 1 GB free), which took the Docker daemon down with it. The
+harness is written and vets clean; it needs a machine with room to hold a
+million-row table. `benchmarks/results.md` is the file it goes in.
+
+What I can say from measurements already taken during development, on Docker
+Desktop on an M-series laptop:
+
+- The claim query at 600k rows (100k pending): **0.8–1.1 ms warm**, index scan
+  on `jobs_claim_idx`, no sort node, 12 buffers touched for a `LIMIT 10`.
+- `COPY` bulk enqueue: **50,000 jobs in 335 ms** (~150k/sec).
+- The partial claim index is **912 kB against 20 MB** for the same columns
+  unfiltered, on a 124 MB table.
+
+The honest prediction for where throughput stops scaling: Postgres, not Go —
+specifically the write amplification of `UPDATE`ing the same rows twice per job
+(claim, then complete) plus the `job_attempts` insert, which is three row
+versions per job for the vacuum to clean up. `SKIP LOCKED` means workers do not
+block each other, so the ceiling should be WAL and autovacuum rather than lock
+contention. That is a prediction, not a measurement, and it is exactly what
+phase 8 exists to check.
+
 ## Running it
 
 ```
-docker compose up -d --build   # or: make up
-curl localhost:8080/healthz
-curl localhost:8080/readyz
+make up          # postgres, queued, and 3 worker replicas
+make seed        # a mixed backlog: successes, failures, panics, a schedule
+make loadgen     # continuous enqueue so the dashboard has something to show
+open http://localhost:8080
 ```
 
-`make help` lists the rest.
+`make help` lists the rest. Everything is environment-driven; see `.env.example`.
+
+## Deployment
+
+Multi-stage build: `golang:1.25` builder with `CGO_ENABLED=0`, runtime on
+`gcr.io/distroless/static:nonroot`. One image holds all three binaries and the
+service picks one with its entrypoint, so the image is built once and shared.
+Templates and migrations are embedded in the binaries, so there is no "did you
+remember to copy `web/`" step.
+
+`make image-size` reports the size. It is not quoted here for the same reason
+the benchmarks are not: it was not measured on this machine.
+
+The builder is `golang:1.25` rather than the 1.23 in the brief because current
+`pgx/v5` requires it. Pinning pgx back to an older release still left a floor of
+1.24 through transitive dependencies, so freezing the driver to hit an exact
+number was not worth it. Still satisfies "Go 1.23+".
+
+## What this isn't
+
+**Not exactly-once.** Handlers must be idempotent. See
+[Why exactly-once is not on offer](#why-exactly-once-is-not-on-offer).
+
+**Not for throughput beyond roughly what phase 8 measures.** Every worker
+contends on one table and one index. When that stops being enough the next step
+is partitioning `jobs` by queue, or sharding by hash of the job id across
+several tables — at which point you have built most of a broker and should
+consider whether you actually want one.
+
+**Not multi-tenant.** There is no tenant column, no per-tenant quota, and no
+isolation between queues beyond the name. One tenant enqueueing a million jobs
+starves everyone else on that queue. Priority is a single global integer, not a
+fair-share scheduler.
+
+**No authentication on the API or dashboard.** Anything that can reach port 8080
+can enqueue jobs, cancel jobs, and read every payload. It expects to sit behind
+something that does authentication.
+
+**No payload encryption and no PII handling.** Payloads are jsonb in the clear,
+readable by anyone with database access and visible on the dashboard.
+
+**`jobs` grows forever.** Nothing deletes succeeded jobs. The partial index
+keeps the *claim* path indifferent to that, but `Stats` is a full aggregate and
+gets linearly slower, and the table will eventually need a retention policy —
+partition by month and drop old partitions, rather than a `DELETE` that leaves
+the vacuum to catch up.
+
+**Missed cron ticks are dropped, not replayed.** If you need catch-up semantics,
+this is the wrong scheduler.
+
+**One Postgres.** No read replicas, no failover handling beyond reconnecting.
+When the database is down the queue is down — which is the honest cost of the
+position that Postgres alone is enough.
+
+### What I would change to scale past it
+
+1. **Partition `jobs` by queue** (or by `state`, keeping terminal states in
+   separate partitions). The claim path stays the same; `Stats` and retention
+   both get dramatically cheaper.
+2. **A summary table for counts**, maintained by trigger, so the dashboard and
+   the depth gauges stop scanning the table.
+3. **Split the hot and cold data.** Move terminal jobs to a history table on
+   completion. The working set becomes the backlog rather than all of history.
+4. **Only then consider a broker.** The point at which this design stops working
+   is much further out than most people assume, and a broker is a second
+   stateful system to operate, back up, and be woken up by.
 
 ## Configuration
 
-Everything is environment driven; see `.env.example`.
+Everything is environment driven; see `.env.example` for the full list with
+defaults.

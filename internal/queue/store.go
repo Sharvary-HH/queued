@@ -9,6 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Sharvary-HH/queued/internal/metrics"
 )
 
 // ErrStaleClaim means the job was not in the state the caller thought it was:
@@ -106,6 +108,7 @@ func (s *Store) Claim(ctx context.Context, queue, workerID string, n int) ([]Job
 		return nil, fmt.Errorf("queue: claim batch must be >= 1, got %d", n)
 	}
 
+	start := time.Now()
 	rows, err := s.pool.Query(ctx, claimSQL, queue, workerID, n)
 	if err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
@@ -116,6 +119,10 @@ func (s *Store) Claim(ctx context.Context, queue, workerID string, n int) ([]Job
 	if err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
 	}
+	// Timed around the scan as well as the query, because the round trip is
+	// what a worker actually waits for.
+	metrics.ClaimLatency.Observe(time.Since(start).Seconds())
+	metrics.ClaimedJobs.Add(float64(len(jobs)))
 	return jobs, nil
 }
 

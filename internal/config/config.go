@@ -17,6 +17,10 @@ type Config struct {
 
 	// Server
 	HTTPAddr string
+	// WorkerHTTPAddr is where a worker serves /metrics and /healthz. Workers
+	// have no API, but the handler timings and the active-slot gauge only exist
+	// in the worker process, so something has to expose them.
+	WorkerHTTPAddr string
 
 	// Worker
 	WorkerID     string
@@ -39,6 +43,7 @@ func Load() (Config, error) {
 	c := Config{
 		DatabaseURL:       env("DATABASE_URL", "postgres://queued:queued@localhost:5432/queued?sslmode=disable"),
 		HTTPAddr:          env("HTTP_ADDR", ":8080"),
+		WorkerHTTPAddr:    env("WORKER_HTTP_ADDR", ":8081"),
 		Queue:             env("QUEUE", "default"),
 		LogLevel:          env("LOG_LEVEL", "info"),
 		WorkerID:          env("WORKER_ID", ""),
@@ -86,6 +91,13 @@ func Load() (Config, error) {
 	}
 	if c.Concurrency < 1 {
 		return c, fmt.Errorf("CONCURRENCY must be >= 1, got %d", c.Concurrency)
+	}
+	// An empty listen address is not an error to net/http — it quietly means
+	// port 80, which then fails to bind as a non-root user and looks like a
+	// mystery. Catch it here where the message can say what is actually wrong.
+	if c.HTTPAddr == "" || c.WorkerHTTPAddr == "" {
+		return c, fmt.Errorf("listen addresses must not be empty (HTTP_ADDR=%q WORKER_HTTP_ADDR=%q)",
+			c.HTTPAddr, c.WorkerHTTPAddr)
 	}
 	if c.ClaimBatch < 1 {
 		return c, fmt.Errorf("CLAIM_BATCH must be >= 1, got %d", c.ClaimBatch)
