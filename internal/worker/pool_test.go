@@ -493,3 +493,36 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
+
+// With NOTIFY off the pool must still get through its work on the poll timer
+// alone. This is the configuration used behind a transaction-mode connection
+// pooler, where LISTEN cannot work, so it has to be a supported way to run
+// rather than only a benchmark switch.
+func TestPoolWorksWithNotifyDisabled(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	const total = 25
+	batch := make([]queue.EnqueueParams, total)
+	for i := range batch {
+		batch[i] = queue.EnqueueParams{Kind: handlers.KindSucceed}
+	}
+	if _, err := h.store.EnqueueMany(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := fastConfig(4)
+	cfg.DisableNotify = true
+	h.start(t, cfg)
+
+	waitFor(t, 30*time.Second, "all jobs to succeed on the poll timer alone", func() bool {
+		return h.countByState(t)[queue.StateSucceeded] == total
+	})
+
+	if h.logs.Contains("listening for enqueue notifications") {
+		t.Error("the listener subscribed even though NOTIFY was disabled")
+	}
+	if !h.logs.Contains("notify listener disabled") {
+		t.Error("the pool did not say it was running poll-only")
+	}
+}

@@ -111,12 +111,13 @@ func run() error {
 	}()
 
 	w := worker.New(store, reg, log, worker.Config{
-		Queue:        cfg.Queue,
-		WorkerID:     cfg.WorkerID,
-		Concurrency:  cfg.Concurrency,
-		ClaimBatch:   cfg.ClaimBatch,
-		PollInterval: cfg.PollInterval,
-		DrainTimeout: cfg.DrainTimeout,
+		Queue:         cfg.Queue,
+		WorkerID:      cfg.WorkerID,
+		Concurrency:   cfg.Concurrency,
+		ClaimBatch:    cfg.ClaimBatch,
+		PollInterval:  cfg.PollInterval,
+		DrainTimeout:  cfg.DrainTimeout,
+		DisableNotify: !cfg.NotifyEnabled,
 	})
 	err = w.Run(ctx)
 	reaperDone.Wait()

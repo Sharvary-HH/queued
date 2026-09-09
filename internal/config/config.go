@@ -30,6 +30,11 @@ type Config struct {
 	PollInterval time.Duration
 	DrainTimeout time.Duration
 	ReapInterval time.Duration
+	// NotifyEnabled turns LISTEN/NOTIFY wakeups on. Set NOTIFY_ENABLED=false
+	// behind a transaction-mode connection pooler, where LISTEN cannot work:
+	// the listener would subscribe and then never hear anything, because its
+	// session is handed to somebody else between statements.
+	NotifyEnabled bool
 	// SchedulerInterval is how often the scheduler ticks while leading, and how
 	// often a follower retries for leadership. It bounds how late a recurring
 	// job can be, so it wants to be well under the finest schedule in use.
@@ -52,6 +57,7 @@ func Load() (Config, error) {
 		PollInterval:      100 * time.Millisecond,
 		DrainTimeout:      30 * time.Second,
 		ReapInterval:      5 * time.Second,
+		NotifyEnabled:     os.Getenv("NOTIFY_ENABLED") != "false",
 		SchedulerInterval: time.Second,
 		VisibilitySec:     60,
 	}

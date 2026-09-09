@@ -138,21 +138,79 @@ gigabytes.
 - **Graceful shutdown**, 4 in-flight 5-second jobs, real SIGTERM to the real
   binary: drained in **4.03 s**, exit 0, nothing left in `claimed`.
 
-## Still missing
+## LISTEN/NOTIFY versus polling at 100 ms
 
-**LISTEN/NOTIFY versus 100 ms polling throughput.** The mechanism is implemented
-and its correctness is tested — `TestNotifyWakesTheClaimerBeforeThePollInterval`
-proves a job is picked up in under a second with a 30-second poll interval, so
-NOTIFY is demonstrably the thing finding the work — but the *throughput*
-comparison between the two is not in the harness.
+The interesting one, because the two do not compete on the same axis.
 
-The honest expectation is that it makes very little difference to throughput and
-a large difference to latency. On a busy queue the claimer never sleeps: it
-reclaims a full batch and loops straight back without ever reaching the select,
-so the notification path is not exercised. NOTIFY earns its place on a queue
-that is mostly idle, where it turns "up to one poll interval" into
-"microseconds" — a latency win, not a throughput one. That is a prediction, and
-it is the next thing to measure.
+### Throughput on a saturated queue: no measurable difference
+
+20,000 jobs, 8 executors, batches of 10. Six runs each, alternating which went
+first, `-count=1` throughout.
+
+| run | notify | polling 100 ms |
+| ---: | ---: | ---: |
+| 1 | 7,766 | 7,001 |
+| 2 | 6,144 | 6,875 |
+| 3 | 8,121 | 6,392 |
+| 4 | 6,534 | 6,745 |
+| 5 | 7,664 | 7,828 |
+| 6 | 6,704 | 7,335 |
+| **mean** | **7,156** | **7,029** |
+| range | 6,144–8,121 | 6,392–7,828 |
+
+**1.8% apart on the means, with ranges that overlap almost completely.** There is
+no throughput difference here; run-to-run variance is several times larger than
+the gap.
+
+That is the predicted result, and the reason is structural: a claimer with work
+waiting reclaims a full batch and loops straight back round. It only reaches the
+select — the only place a notification can be read — when a batch comes back
+short. On a saturated queue that never happens, so NOTIFY has nothing to
+contribute.
+
+Worth recording how nearly this went wrong. The first single run showed notify
+ahead by 18%, which looked like a real finding. It was ordering and noise: with
+n=1 and polling running first on a cold cache, the gap was an artifact. Three
+repeats then produced *byte-identical* numbers, which is not variance but Go's
+test cache returning a previous run's timings for an unchanged package. `make
+bench` now passes `-count=1`, and it is not optional — a benchmark reporting
+numbers it did not measure is worse than no benchmark at all.
+
+### Latency on an idle queue: 9.4× better
+
+One job at a time into an empty queue, waiting for each to be picked up before
+enqueueing the next, so every sample starts from a genuinely idle claimer. 40
+samples. Measured from `Enqueue` returning to the handler being entered.
+
+| | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| polling 100 ms | 55.1 ms | 58.3 ms | 58.7 ms |
+| **notify** | **5.9 ms** | **11.3 ms** | **12.9 ms** |
+
+**9.4× lower median.** And the polling number is a satisfying confirmation that
+the model is right rather than the measurement being lucky: a job arriving at a
+uniformly random point in a 100 ms poll cycle waits 50 ms on average, and the
+measured p50 is 55 ms. The p95/p99 sit just under 60 ms because the wait is
+bounded by the interval — polling's latency distribution is flat-topped, not
+long-tailed.
+
+NOTIFY's 5.9 ms is round trip plus scheduling, not waiting.
+
+### What the pair is actually for
+
+The two numbers together are the whole argument for carrying both mechanisms:
+
+- **NOTIFY buys latency, not throughput.** It is worth nothing on a busy queue
+  and nearly an order of magnitude on an idle one — which is the state most
+  queues are in most of the time.
+- **Polling buys correctness, not latency.** It costs nothing measurable in
+  throughput, and it is what makes a missed notification a 100 ms delay instead
+  of a job that never runs.
+
+Dropping polling to chase NOTIFY's latency would trade a guarantee for something
+already had. Dropping NOTIFY and shortening the poll interval to chase its
+latency would mean querying the database ten or a hundred times more often while
+idle, to approximate a wakeup that costs one connection.
 
 ## What these numbers justify
 

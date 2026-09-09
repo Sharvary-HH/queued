@@ -821,11 +821,43 @@ backlog is.
  Execution Time: 0.132 ms
 ```
 
-**Not yet measured:** LISTEN/NOTIFY versus 100 ms polling *throughput*. The
-mechanism works and its correctness is tested, but the expectation is that it
-barely moves throughput and moves latency a lot — a busy claimer never sleeps,
-so it never reaches the notification path. NOTIFY earns its place on an idle
-queue. That is a prediction, and it is the next thing to measure.
+**LISTEN/NOTIFY vs polling at 100 ms.** These do not compete on the same axis,
+and the numbers say so.
+
+*Throughput, saturated queue*, six runs each alternating order:
+
+| | mean | range |
+| --- | ---: | ---: |
+| notify | 7,156 | 6,144–8,121 |
+| polling 100 ms | 7,029 | 6,392–7,828 |
+
+**1.8% apart, with ranges that overlap almost completely — no difference.** A
+claimer with work waiting reclaims a full batch and loops straight back; it only
+reaches the select, the one place a notification can be read, when a batch comes
+back short. On a busy queue that never happens.
+
+*Latency, idle queue*, enqueue to handler entry, 40 samples:
+
+| | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| polling 100 ms | 55.1 ms | 58.3 ms | 58.7 ms |
+| **notify** | **5.9 ms** | **11.3 ms** | **12.9 ms** |
+
+**9.4× lower median.** The polling figure also confirms the model rather than
+just the measurement: a job arriving at a random point in a 100 ms cycle waits
+50 ms on average, and p50 came out at 55 ms. Its distribution is flat-topped,
+not long-tailed, because the wait is bounded by the interval.
+
+So: **NOTIFY buys latency, polling buys correctness, and neither buys the
+other's.** That is the case for carrying both. Dropping polling would trade a
+guarantee for something already had; dropping NOTIFY and shortening the poll
+interval would mean querying the database ten or a hundred times more often
+while idle to approximate a wakeup that costs one connection.
+
+One process note, since it nearly produced a wrong answer: the first single run
+showed notify 18% ahead, which was ordering and noise. Three repeats then
+returned byte-identical numbers — Go's test cache serving a previous run's
+timings. `make bench` passes `-count=1`, which is not optional.
 
 ## Running it
 
@@ -927,3 +959,11 @@ position that Postgres alone is enough.
 
 Everything is environment driven; see `.env.example` for the full list with
 defaults.
+
+One worth knowing about: **`NOTIFY_ENABLED=false`** turns the listener off and
+leaves the pool polling. That is not only a benchmark switch — `LISTEN` does not
+survive a connection pooler in transaction-pooling mode. Point a worker at
+PgBouncer with `pool_mode=transaction` and the listener will connect, subscribe,
+and then silently never hear anything, because its session is handed to somebody
+else between statements. Polling still works there, so it is better to let an
+operator say so than to leave a listener quietly doing nothing.

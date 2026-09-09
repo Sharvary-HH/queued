@@ -39,6 +39,18 @@ type Config struct {
 	// signal before they are cancelled and released.
 	DrainTimeout time.Duration
 
+	// DisableNotify turns off the LISTEN/NOTIFY wakeups and leaves the pool
+	// polling only.
+	//
+	// Not just a benchmark switch: LISTEN does not survive a connection pooler
+	// in transaction-pooling mode. Point this at PgBouncer with
+	// pool_mode=transaction and the listener will connect, subscribe, and
+	// silently never hear anything, because its session is handed to somebody
+	// else between statements. Polling still works there, so the honest thing
+	// is to let an operator say so rather than leave a listener quietly doing
+	// nothing.
+	DisableNotify bool
+
 	Backoff Backoff
 }
 
@@ -131,11 +143,18 @@ func (p *Pool) Run(ctx context.Context) error {
 
 	listener := newListener(p.store.Pool(), p.log)
 	var listenerDone sync.WaitGroup
-	listenerDone.Add(1)
-	go func() {
-		defer listenerDone.Done()
-		listener.run(ctx)
-	}()
+	if !p.cfg.DisableNotify {
+		listenerDone.Add(1)
+		go func() {
+			defer listenerDone.Done()
+			listener.run(ctx)
+		}()
+	} else {
+		// Nothing ever sends on the wake channel, so the claimer's select falls
+		// through to the poll timer every time.
+		p.log.Info("notify listener disabled, polling only",
+			"poll_interval", p.cfg.PollInterval.String())
+	}
 
 	var executors errgroup.Group
 	for i := range p.cfg.Concurrency {

@@ -36,9 +36,13 @@ race: ## the gate: run the suite under the race detector
 lint: ## run golangci-lint
 	golangci-lint run ./...
 
+# -count=1 is not optional. Without it the test cache happily returns a previous
+# run's timings for an unchanged package, and a benchmark that reports numbers
+# it did not measure is worse than no benchmark.
 .PHONY: bench
 bench: ## run the benchmarks against the compose database
-	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -tags bench -v -timeout 60m -run 'Test(Throughput|BatchedVsSingleClaim|ClaimAtDepth)' ./internal/bench/
+	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -tags bench -count=1 -v -timeout 60m \
+		-run 'Test(Throughput|BatchedVsSingleClaim|ClaimAtDepth|NotifyVsPolling)' ./internal/bench/
 
 .PHONY: loadgen
 loadgen: ## enqueue continuously so the dashboard has something to show
