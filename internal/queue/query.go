@@ -143,12 +143,22 @@ type ThroughputPoint struct {
 	Failed    int64
 }
 
+// make_interval(mins => $1) rather than the ($1 || ' minutes')::interval trick.
+// The string-concatenation form makes pgx infer $1 as text, because that is what
+// || wants, and it then cannot encode a Go int into it:
+//
+//	unable to encode 60 into text format for text (OID 25)
+//
+// make_interval takes an integer, so the parameter has an honest type. The
+// failure was invisible from the outside — the handler logs a warning and
+// renders an empty chart, so the page returned 200 and simply said "no attempts
+// finished in the last hour" while thousands were finishing every minute.
 const throughputSQL = `
 SELECT to_char(date_trunc('minute', finished_at), 'HH24:MI') AS minute,
        count(*) FILTER (WHERE error IS NULL)     AS succeeded,
        count(*) FILTER (WHERE error IS NOT NULL) AS failed
 FROM job_attempts
-WHERE finished_at > now() - ($1 || ' minutes')::interval
+WHERE finished_at > now() - make_interval(mins => $1)
 GROUP BY 1
 ORDER BY 1`
 

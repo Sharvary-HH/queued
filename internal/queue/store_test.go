@@ -580,3 +580,160 @@ func mustEnqueue(t *testing.T, s *queue.Store, p queue.EnqueueParams) queue.Job 
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// The throughput query renders the dashboard's chart, and the handler logs a
+// warning and draws an empty chart if it fails — so a broken query looks
+// exactly like an idle queue and returns 200. It shipped broken once for
+// precisely that reason (pgx inferred the interval parameter as text and could
+// not encode an int into it), so it gets a test that runs it for real.
+func TestThroughputReportsFinishedAttempts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, _ := newStore(t)
+
+	seed(t, store, 3, "noop")
+	claimed, err := store.Claim(ctx, "default", "worker-a", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 3 {
+		t.Fatalf("claimed %d, want 3", len(claimed))
+	}
+
+	if err := store.Complete(ctx, claimed[0].ID, "worker-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Fail(ctx, queue.FailRequest{
+		JobID: claimed[1].ID, WorkerID: "worker-a", Err: "nope", RetryAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// claimed[2] is left running, so it has no finished_at and must not appear.
+
+	points, err := store.Throughput(ctx, 60)
+	if err != nil {
+		t.Fatalf("throughput: %v", err)
+	}
+	if len(points) == 0 {
+		t.Fatal("no throughput points for two attempts that just finished")
+	}
+
+	var succeeded, failed int64
+	for _, p := range points {
+		succeeded += p.Succeeded
+		failed += p.Failed
+	}
+	if succeeded != 1 {
+		t.Errorf("succeeded = %d, want 1", succeeded)
+	}
+	if failed != 1 {
+		t.Errorf("failed = %d, want 1", failed)
+	}
+}
+
+func TestStatsCountsByQueueAndState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, _ := newStore(t)
+
+	seed(t, store, 4, "noop")
+	mustEnqueue(t, store, queue.EnqueueParams{Kind: "noop", Queue: "other"})
+
+	stats, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[string]int64{}
+	for _, s := range stats {
+		got[s.Queue+"/"+string(s.State)] += s.Count
+	}
+	if got["default/pending"] != 4 {
+		t.Errorf("default/pending = %d, want 4", got["default/pending"])
+	}
+	if got["other/pending"] != 1 {
+		t.Errorf("other/pending = %d, want 1", got["other/pending"])
+	}
+}
+
+func TestCancelOnlyAppliesToPendingJobs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, _ := newStore(t)
+	seed(t, store, 2, "noop")
+
+	all, _, err := store.ListJobs(ctx, queue.JobFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("listed %d jobs, want 2", len(all))
+	}
+
+	cancelled, err := store.Cancel(ctx, all[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.State != queue.StateCancelled {
+		t.Errorf("state = %q, want cancelled", cancelled.State)
+	}
+
+	// A cancelled job is not claimable.
+	claimed, err := store.Claim(ctx, "default", "worker-a", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed %d jobs, want 1 (the other was cancelled)", len(claimed))
+	}
+
+	// And a claimed job cannot be cancelled out from under its worker.
+	if _, err := store.Cancel(ctx, claimed[0].ID); err == nil {
+		t.Error("cancelled a job that a worker is already running")
+	}
+}
+
+func TestListJobsFiltersAndPages(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, _ := newStore(t)
+
+	seed(t, store, 5, "alpha")
+	seed(t, store, 3, "beta")
+
+	byKind, _, err := store.ListJobs(ctx, queue.JobFilter{Kind: "beta"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byKind) != 3 {
+		t.Errorf("kind filter returned %d jobs, want 3", len(byKind))
+	}
+
+	page1, next, err := store.ListJobs(ctx, queue.JobFilter{Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page1) != 5 || next == 0 {
+		t.Fatalf("first page: %d jobs, cursor %d", len(page1), next)
+	}
+
+	page2, _, err := store.ListJobs(ctx, queue.JobFilter{Limit: 5, Before: next})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2) != 3 {
+		t.Errorf("second page returned %d jobs, want 3", len(page2))
+	}
+	// Keyset paging must not repeat rows across pages.
+	seen := map[int64]bool{}
+	for _, j := range append(page1, page2...) {
+		if seen[j.ID] {
+			t.Errorf("job %d appeared on both pages", j.ID)
+		}
+		seen[j.ID] = true
+	}
+
+	if _, _, err := store.ListJobs(ctx, queue.JobFilter{State: "not-a-state"}); err == nil {
+		t.Error("an unknown state was accepted")
+	}
+}
