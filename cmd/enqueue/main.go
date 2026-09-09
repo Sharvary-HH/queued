@@ -10,6 +10,7 @@ import (
 
 	"github.com/Sharvary-HH/queued/internal/config"
 	"github.com/Sharvary-HH/queued/internal/queue"
+	"github.com/Sharvary-HH/queued/internal/scheduler"
 )
 
 // enqueue is the manual-testing CLI: it drops jobs straight into the table
@@ -25,6 +26,8 @@ func main() {
 	flag.IntVar(&opts.count, "n", 1, "how many to enqueue")
 	flag.DurationVar(&opts.delay, "delay", 0, "delay before the job becomes runnable")
 	flag.DurationVar(&opts.visibility, "visibility-timeout", 0, "how long a claim is honoured")
+	flag.StringVar(&opts.cron, "cron", "", "register a recurring schedule instead of a single job")
+	flag.StringVar(&opts.name, "name", "", "name of the recurring schedule (required with -cron)")
 	flag.Parse()
 
 	if err := run(opts); err != nil {
@@ -43,12 +46,17 @@ type options struct {
 	count       int
 	delay       time.Duration
 	visibility  time.Duration
+	cron        string
+	name        string
 }
 
 func run(opts options) error {
 	if opts.kind == "" {
 		flag.Usage()
 		return errors.New("-kind is required")
+	}
+	if opts.cron != "" && opts.name == "" {
+		return errors.New("-cron needs -name to identify the schedule")
 	}
 	if opts.count < 1 {
 		return fmt.Errorf("-n must be >= 1, got %d", opts.count)
@@ -71,6 +79,29 @@ func run(opts options) error {
 	}
 	defer pool.Close()
 	store := queue.NewStore(pool)
+
+	// -cron registers a schedule; the scheduler in queued takes it from there.
+	if opts.cron != "" {
+		next, err := scheduler.NextRun(opts.cron, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		entry, err := store.UpsertRecurring(ctx, queue.RecurringParams{
+			Name:      opts.name,
+			Cron:      opts.cron,
+			Queue:     opts.queue,
+			Kind:      opts.kind,
+			Payload:   []byte(opts.payload),
+			Enabled:   true,
+			NextRunAt: next,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("scheduled %q: %s runs %s, next at %s\n",
+			entry.Name, entry.Kind, entry.Cron, entry.NextRunAt.Format(time.RFC3339))
+		return nil
+	}
 
 	params := queue.EnqueueParams{
 		Queue:             opts.queue,

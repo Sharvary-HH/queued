@@ -16,6 +16,7 @@ import (
 	"github.com/Sharvary-HH/queued/internal/logging"
 	"github.com/Sharvary-HH/queued/internal/migrate"
 	"github.com/Sharvary-HH/queued/internal/queue"
+	"github.com/Sharvary-HH/queued/internal/scheduler"
 	"github.com/Sharvary-HH/queued/internal/worker"
 	"github.com/Sharvary-HH/queued/migrations"
 )
@@ -72,13 +73,21 @@ func run() error {
 	// The server reaps too. If reclaiming only happened in worker processes,
 	// then the one failure that most needs recovering from — every worker dying
 	// at once — would be the one case with nobody left to do it.
-	var reaperDone sync.WaitGroup
-	reaperDone.Add(1)
+	var background sync.WaitGroup
+	background.Add(1)
 	go func() {
-		defer reaperDone.Done()
+		defer background.Done()
 		worker.NewReaper(store, log, worker.ReaperConfig{Interval: cfg.ReapInterval}).Run(ctx)
 	}()
-	defer reaperDone.Wait()
+
+	// Every instance campaigns; the advisory lock sorts out which one acts.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		scheduler.New(store, log, scheduler.Config{Interval: cfg.SchedulerInterval}).Run(ctx)
+	}()
+
+	defer background.Wait()
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

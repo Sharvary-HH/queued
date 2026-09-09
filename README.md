@@ -46,17 +46,116 @@ happen.
 
 ## Status
 
-Phases 0–5 are done: scaffold, schema, the claim query, the worker pool,
-retries/DLQ/reaper, and the correctness suite. Still to come: the cron
-scheduler, the HTTP API and dashboard, benchmarks, and deployment docs.
+Phases 0–6 are done: scaffold, schema, the claim query, the worker pool,
+retries/DLQ/reaper, the correctness suite, and the cron scheduler. Still to
+come: the HTTP API and dashboard, benchmarks, and deployment docs.
 
 ```
 make race     # go test -race ./...   — the gate on every phase
 make test
 ```
 
-51 tests, all against a real Postgres started by testcontainers. Green under
+58 tests, all against a real Postgres started by testcontainers. Green under
 `-race` at `-count=3`; property 1 also at `-count=10`.
+
+## The scheduler
+
+`internal/scheduler/cron.go`. Every `queued` instance runs one; a Postgres
+advisory lock decides which one acts.
+
+Expressions are parsed with `robfig/cron`, accepting standard five-field cron,
+an optional leading seconds field, and `@`-descriptors. Seconds exist mostly so
+the tests observe ten ticks in ten seconds rather than one in sixty, but they
+cost nothing and the rest of the system never sees the difference.
+
+### Why an advisory lock is enough
+
+- **The database is already a hard dependency.** Adding etcd or Consul to elect
+  a leader for work that only matters when Postgres is up means adding a second
+  thing that can fail in order to guard against the first one failing.
+- **Session-scoped locks are released automatically when the connection ends** —
+  clean exit, crash, `kill -9`, network partition, server restart. No lease to
+  expire, no TTL to tune, no way to leave a lock held by a process that no
+  longer exists.
+- It is one function call on a connection we already have.
+
+### Its failure mode, stated plainly
+
+**The lock is released on connection loss, and that release is not coordinated
+with the leader noticing.** If the network drops, Postgres tears the session
+down and frees the lock immediately, while the leader may not find out until its
+next query. In that window a second instance can acquire the lock and start
+scheduling while the first still believes it leads. The same happens if the
+leader is paused long enough for TCP to give up — a stop-the-world GC pause, a
+hypervisor freeze, a suspended laptop.
+
+That is not a defect in advisory locks. It is the standard result that a
+distributed lock without fencing gives mutual exclusion of *lock ownership*, not
+of *work*. Anything needing the stronger guarantee must not rely on leadership.
+
+### So leadership is an optimisation, not the guarantee
+
+Correctness lives in the data, in three layers, and would hold with the election
+deleted entirely:
+
+1. **Compare-and-swap.** Advancing an entry only matches if `next_run_at` is
+   still the value the scheduler read, so only one instance can move a given
+   tick forward.
+2. **One statement.** The `INSERT` selects from that `UPDATE`'s output, so a
+   scheduler that lost the swap inserts nothing — not because it checked, but
+   because there is nothing to select from. There is also no window where a
+   scheduler advanced the tick and then died before enqueueing.
+3. **Idempotency key.** `cron:<name>:<scheduled unix>` — derived from the entry
+   and the instant, not the process, so two schedulers that somehow both won
+   would be writing the same key and the unique index collapses them.
+
+```sql
+WITH advanced AS (
+    UPDATE recurring_jobs SET last_run_at = now(), next_run_at = $3
+    WHERE id = $1 AND next_run_at = $2 AND enabled
+    RETURNING queue, kind, payload
+)
+INSERT INTO jobs (queue, kind, payload, idempotency_key)
+SELECT queue, kind, payload, $4 FROM advanced
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING id
+```
+
+`TestNoDuplicatesWithoutLeadership` bypasses the election completely — 24
+goroutines all convinced the same tick is theirs — and exactly one wins.
+
+### Missed ticks are dropped, not replayed
+
+A scheduler that was down for an hour with a per-minute schedule does not owe
+sixty runs. The next run is computed from *now*, not from the missed instant:
+the point of "every minute" is freshness, and sixty stale runs are worse than
+one fresh one. `TestMissedTicksAreDroppedNotReplayed` fakes an hour of downtime
+on a per-second schedule and gets 3 jobs, not 3600.
+
+### Demonstrated
+
+Three `queued` instances against one database, `*/5 * * * * *`:
+
+```
+$ go run ./cmd/enqueue -kind succeed -cron '*/5 * * * * *' -name heartbeat
+scheduled "heartbeat": succeed runs */5 * * * * *, next at 2026-09-08T20:40:40+05:30
+
+=== who led? ===
+instance 1: 1
+instance 2: 0
+instance 3: 0
+
+{"msg":"recurring job enqueued","recurring_job":"heartbeat","job_id":1,"scheduled_for":"2026-09-08T15:10:40Z","next_run_at":"2026-09-08T15:10:45Z"}
+{"msg":"recurring job enqueued","recurring_job":"heartbeat","job_id":2,"scheduled_for":"2026-09-08T15:10:45Z","next_run_at":"2026-09-08T15:10:50Z"}
+{"msg":"recurring job enqueued","recurring_job":"heartbeat","job_id":3,"scheduled_for":"2026-09-08T15:10:50Z","next_run_at":"2026-09-08T15:10:55Z"}
+
+ total | distinct_ticks
+-------+----------------
+     5 |              5
+```
+
+One leader of three, ticks landing on the exact five-second boundaries, and
+every job a distinct instant.
 
 ## The reaper
 

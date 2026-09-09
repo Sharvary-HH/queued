@@ -19,31 +19,36 @@ type Config struct {
 	HTTPAddr string
 
 	// Worker
-	WorkerID      string
-	Queue         string
-	Concurrency   int
-	ClaimBatch    int
-	PollInterval  time.Duration
-	DrainTimeout  time.Duration
-	ReapInterval  time.Duration
-	VisibilitySec int
+	WorkerID     string
+	Queue        string
+	Concurrency  int
+	ClaimBatch   int
+	PollInterval time.Duration
+	DrainTimeout time.Duration
+	ReapInterval time.Duration
+	// SchedulerInterval is how often the scheduler ticks while leading, and how
+	// often a follower retries for leadership. It bounds how late a recurring
+	// job can be, so it wants to be well under the finest schedule in use.
+	SchedulerInterval time.Duration
+	VisibilitySec     int
 
 	LogLevel string
 }
 
 func Load() (Config, error) {
 	c := Config{
-		DatabaseURL:   env("DATABASE_URL", "postgres://queued:queued@localhost:5432/queued?sslmode=disable"),
-		HTTPAddr:      env("HTTP_ADDR", ":8080"),
-		Queue:         env("QUEUE", "default"),
-		LogLevel:      env("LOG_LEVEL", "info"),
-		WorkerID:      env("WORKER_ID", ""),
-		Concurrency:   8,
-		ClaimBatch:    10,
-		PollInterval:  100 * time.Millisecond,
-		DrainTimeout:  30 * time.Second,
-		ReapInterval:  5 * time.Second,
-		VisibilitySec: 60,
+		DatabaseURL:       env("DATABASE_URL", "postgres://queued:queued@localhost:5432/queued?sslmode=disable"),
+		HTTPAddr:          env("HTTP_ADDR", ":8080"),
+		Queue:             env("QUEUE", "default"),
+		LogLevel:          env("LOG_LEVEL", "info"),
+		WorkerID:          env("WORKER_ID", ""),
+		Concurrency:       8,
+		ClaimBatch:        10,
+		PollInterval:      100 * time.Millisecond,
+		DrainTimeout:      30 * time.Second,
+		ReapInterval:      5 * time.Second,
+		SchedulerInterval: time.Second,
+		VisibilitySec:     60,
 	}
 
 	var err error
@@ -66,6 +71,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.ReapInterval, err = envDur("REAP_INTERVAL", c.ReapInterval); err != nil {
+		return c, err
+	}
+	if c.SchedulerInterval, err = envDur("SCHEDULER_INTERVAL", c.SchedulerInterval); err != nil {
 		return c, err
 	}
 
