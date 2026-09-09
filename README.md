@@ -56,8 +56,13 @@ make seed     # a mixed backlog to look at
 make race     # go test -race ./...  — the gate on every phase
 ```
 
-58 tests, all against a real Postgres started by testcontainers. Green under
+63 tests, all against a real Postgres started by testcontainers. Green under
 `-race` at `-count=3`; property 1 also at `-count=10`.
+
+![Overview](docs/screenshots/overview.png)
+
+*The dashboard under load — three workers, a load generator, two cron schedules.
+More in [API and dashboard](#api-and-dashboard).*
 
 ## Architecture
 
@@ -716,17 +721,116 @@ discard every row it skips, so page 500 costs five hundred times page 1 — and 
 a table being inserted into while you page, the offsets shift underneath you and
 rows are silently skipped and repeated.
 
-The dashboard is server-rendered `html/template`: overview with counts and a
-throughput chart, a filterable job list, job detail with the full attempt
-history, the dead-letter queue with requeue buttons, and the schedules with
-enable/disable. No SPA, no build step. Auto-refresh is a few lines of vanilla JS
-that reloads only while the tab is visible — a dashboard forgotten in a
-background tab should not keep querying the database all weekend.
+The dashboard is server-rendered `html/template`. No SPA, no build step, no
+JavaScript framework — it is a few hundred rows of a database table with buttons
+on some of them, and anything more elaborate would be a second project with its
+own toolchain to keep working. Auto-refresh is a few lines of vanilla JS that
+reloads only while the tab is visible: a dashboard forgotten in a background tab
+should not keep querying the database all weekend.
 
-One bug worth recording, because it failed silently: every page file defines a
-`content` block, and parsing them all into one template set means the last file
-alphabetically wins for *all* of them. Every page rendered the recurring-jobs
-page, with a 200 and no error anywhere. Each page now gets its own set.
+Screenshots below are from a live stack under load — three worker replicas,
+`make loadgen` feeding it, and two cron schedules firing.
+
+### Overview
+
+![Overview](docs/screenshots/overview.png)
+
+The five tiles are every state a job can be in, each linking to that filter on
+the job list. `claimed` reading **0** with 108,457 succeeded is the normal
+picture and the useful one: work is arriving and leaving faster than a page
+render, so nothing is sitting held. A `claimed` count that climbs and stays up
+is the first sign workers are stuck or dying.
+
+The chart is attempts that *finished*, bucketed by minute, read from
+`job_attempts` rather than from `jobs` — a job's own row only remembers its
+latest state, so the history table is the only place individual executions have
+timestamps. Green is successes, red is failures, stacked. Peak here is
+**13,403/min**, which is the load generator rather than a limit.
+
+This chart is also the bug that shipped broken and was only caught by looking at
+the rendered page — see the note at the end of this section.
+
+### Jobs
+
+![Job list](docs/screenshots/jobs.png)
+
+Filter by state, queue and kind; the kind dropdown is populated from the kinds
+actually present in the table, so it shows what is really there rather than what
+the code happens to register. `ATTEMPT` reads `1/5` — used against budget —
+which is what tells you at a glance whether a job is on its first try or its
+last.
+
+Paging is keyset (`WHERE id < cursor`), not `OFFSET`. `OFFSET` makes the
+database walk and discard every row it skips, so page 500 costs five hundred
+times page 1, and on a table being written to while you page the offsets shift
+underneath you and rows are silently skipped and repeated.
+
+### Dead letter queue
+
+![Dead letter queue](docs/screenshots/dead.png)
+
+Three different failure modes sitting side by side, which is the point of
+showing this page rather than describing it:
+
+- **`panics` — 1 attempt.** A nil-map write inside the handler. The panic was
+  recovered, the job failed, and the worker carried on. `max_attempts` was 1 for
+  these, so one try and out.
+- **`always-fails` — 2 attempts.** A retryable error that never stops being an
+  error, so it walked its whole budget and stopped. Bounded retries, property 4.
+- **`invalid-payload` — 1 attempt.** A *permanent* error. Its budget was 5 and it
+  used one, because the handler said the payload will never pass validation and
+  burning four more attempts would only delay the operator finding out.
+
+Every row has a Requeue button, which resets `attempt` to 0 — an operator
+clicking it is saying "I fixed the cause", so handing the job back with a spent
+budget would bounce it straight back here.
+
+### Job detail
+
+![Job detail](docs/screenshots/job-detail.png)
+
+Everything about one job, and underneath it the full attempt history: which
+worker took each try, when it started and finished, how long it took, and what
+it failed with.
+
+The `last_error` panel is why panics are debuggable here. It carries the whole
+stack, right down through `worker.safely` catching it to
+`handlers.(*Set).panics` throwing it. A panic recorded as "handler panicked"
+with no stack tells whoever has to fix it almost nothing.
+
+### Recurring
+
+![Recurring jobs](docs/screenshots/recurring.png)
+
+The cron schedules, with last run, next run and a live countdown. Enable and
+disable are one click; re-enabling schedules the next run from *now*, so a
+schedule that was off for a week does not come back believing it owes a week of
+ticks.
+
+### Two bugs here that a status code could not catch
+
+Both are worth recording because both returned **HTTP 200** while being wrong,
+and both were found by rendering the page and looking at it.
+
+**Every page rendered the recurring-jobs page.** All six page files define a
+`content` block, and parsing them into one template set means the last file
+alphabetically wins for *all* of them. `/`, `/jobs` and `/dead` all served the
+recurring page. Each page now gets its own template set.
+
+**The throughput chart had never once worked.** The query used
+`($1 || ' minutes')::interval`, which makes pgx infer the parameter as `text` —
+that is what `||` wants — and it then cannot encode a Go `int` into it:
+
+```
+unable to encode 60 into text format for text (OID 25)
+```
+
+`make_interval(mins => $1)` takes an integer, so the parameter has an honest
+type. The failure was invisible because the handler logs a warning and renders
+an empty chart, so the page said *"no attempts finished in the last hour"* while
+7,208 attempts a minute were finishing. It now has a test that runs the query
+for real, as do `Stats`, `Cancel` and keyset paging — the rest of the query
+layer the dashboard leans on that nothing had been exercising.
 
 ## Metrics
 
