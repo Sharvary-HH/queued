@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -249,15 +250,26 @@ func TestClaimAtDepth(t *testing.T) {
 		t.Logf("depth=%-8d table=%-8s claim_idx=%-8s  p50=%-8s p95=%-8s p99=%s",
 			depth, size, idxSize, p50, p95, p99)
 
-		var plan string
-		if err := pool.QueryRow(ctx, `
-			EXPLAIN (ANALYZE, COSTS OFF, FORMAT TEXT)
+		// EXPLAIN returns the plan one line per row. Scanning a single row
+		// gets only "Limit ..." and hides everything the plan is read for.
+		rows, err := pool.Query(ctx, `
+			EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
 			SELECT id FROM jobs WHERE state = 'pending' AND queue = 'default' AND run_at <= now()
-			ORDER BY priority, run_at FOR UPDATE SKIP LOCKED LIMIT 10`).Scan(&plan); err != nil {
+			ORDER BY priority, run_at FOR UPDATE SKIP LOCKED LIMIT 10`)
+		if err != nil {
 			t.Logf("explain: %v", err)
-		} else {
-			t.Logf("depth=%-8d plan: %s", depth, plan)
+			continue
 		}
+		var plan []string
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				t.Fatal(err)
+			}
+			plan = append(plan, line)
+		}
+		rows.Close()
+		t.Logf("depth=%d plan:\n%s", depth, strings.Join(plan, "\n"))
 	}
 }
 

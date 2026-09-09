@@ -46,8 +46,9 @@ happen.
 
 ## Status
 
-All nine phases are implemented. Phase 8's *numbers* are the one gap — see
-[Benchmarks](#benchmarks).
+All nine phases are done, benchmarks included.
+**~10,000 jobs/sec**, and the claim query costs 4% more at a million rows than
+at a thousand — see [Benchmarks](#benchmarks).
 
 ```
 make up       # postgres + queued + 3 workers
@@ -759,42 +760,72 @@ Logging is `log/slog`, JSON to stdout, with `job_id`, `kind`, `attempt` and
 
 ## Benchmarks
 
-The harness is `internal/bench`, behind a `bench` build tag so it cannot run
-during `go test ./...`:
+Full detail and method in [`benchmarks/results.md`](benchmarks/results.md).
+Postgres 16 in a Docker VM on an Apple Silicon laptop, **`fsync` on**, default
+settings — a floor, not a ceiling. Run them with `make up && make bench`.
+
+**Throughput, no-op handler, batches of 10:**
+
+| workers | jobs/sec | claim p50 | claim p95 | claim p99 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1  | 2,520  | 587 µs  | 789 µs  | 1.06 ms |
+| 4  | 6,936  | 721 µs  | 976 µs  | 1.47 ms |
+| 16 | 8,719  | 1.87 ms | 3.35 ms | 14.1 ms |
+| 64 | 10,672 | 6.14 ms | 21.6 ms | 109 ms  |
+
+**It stops scaling between 4 and 16 workers, and the limit is Postgres.**
+1→4 workers is 2.75× on 4× the concurrency. 4→16 is 4× the concurrency for
+**1.26×** the throughput; 16→64 another 4× for **1.22×**. Latency meanwhile
+rises almost exactly in proportion to worker count. Throughput flat plus latency
+linear in concurrency is the signature of a saturated server: past the knee the
+extra workers are queueing, not working.
+
+The arithmetic says why. **Every job costs four row versions** — `UPDATE` to
+claim, `INSERT` the attempt row, `UPDATE` to complete, `UPDATE` to close the
+attempt. Postgres has no in-place update, so at 10k jobs/sec that is 40k row
+versions/sec written and then collected by autovacuum. WAL and vacuum are the
+ceiling, and the Go process is idle throughout.
+
+What is *not* the limit is lock contention. `SKIP LOCKED` means no worker ever
+waits for another, so the curve flattens instead of collapsing — without it,
+adding workers would make throughput go *down*.
+
+**Batched vs single claim** (8 workers, 10k jobs):
+
+| batch | jobs/sec |
+| ---: | ---: |
+| 1 | 4,589 |
+| 10 | 8,431 |
+
+**1.84×.** Less than 10× because only the claim is amortised — the completion
+write is still one round trip per job, which is where the remaining time goes.
+
+**Queue depth — does the claim query survive a million rows?**
+
+| depth | table | `jobs_claim_idx` | p50 | p95 | p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 320 kB | 16 kB | 566 µs | 683 µs | 765 µs |
+| 1,000,000 | 216 MB | 6.3 MB | 589 µs | 779 µs | 1.04 ms |
+
+**A thousand times the rows costs 4% on p50.** At 1M rows the plan touches
+**six buffers** to find ten jobs, with no sort — the index supplies the ordering,
+so `LIMIT 10` reads what it needs and stops. The query does not care how deep the
+backlog is.
 
 ```
-make up && make bench
+ Limit (actual time=0.100..0.104 rows=10 loops=1)
+   ->  LockRows (actual time=0.099..0.103 rows=10 loops=1)
+         ->  Index Scan using jobs_claim_idx on jobs (actual time=0.055..0.056 rows=10)
+               Index Cond: ((queue = 'default'::text) AND (run_at <= now()))
+               Buffers: shared hit=6
+ Execution Time: 0.132 ms
 ```
 
-It measures throughput at 1/4/16/64 workers with a no-op handler, claim
-p50/p95/p99 at each level, batched-vs-single claim, and the claim query at a
-depth of 1M rows with `EXPLAIN ANALYZE` on both sides. It runs against the
-compose Postgres rather than the test container, because that container has
-`fsync=off` — which roughly doubles write throughput and would make every number
-a lie.
-
-**The numbers are not in this README yet, and I am not going to invent them.**
-The machine this was built on ran out of disk (Docker's VM image is 15 GB and
-the host had under 1 GB free), which took the Docker daemon down with it. The
-harness is written and vets clean; it needs a machine with room to hold a
-million-row table. `benchmarks/results.md` is the file it goes in.
-
-What I can say from measurements already taken during development, on Docker
-Desktop on an M-series laptop:
-
-- The claim query at 600k rows (100k pending): **0.8–1.1 ms warm**, index scan
-  on `jobs_claim_idx`, no sort node, 12 buffers touched for a `LIMIT 10`.
-- `COPY` bulk enqueue: **50,000 jobs in 335 ms** (~150k/sec).
-- The partial claim index is **912 kB against 20 MB** for the same columns
-  unfiltered, on a 124 MB table.
-
-The honest prediction for where throughput stops scaling: Postgres, not Go —
-specifically the write amplification of `UPDATE`ing the same rows twice per job
-(claim, then complete) plus the `job_attempts` insert, which is three row
-versions per job for the vacuum to clean up. `SKIP LOCKED` means workers do not
-block each other, so the ceiling should be WAL and autovacuum rather than lock
-contention. That is a prediction, not a measurement, and it is exactly what
-phase 8 exists to check.
+**Not yet measured:** LISTEN/NOTIFY versus 100 ms polling *throughput*. The
+mechanism works and its correctness is tested, but the expectation is that it
+barely moves throughput and moves latency a lot — a busy claimer never sleeps,
+so it never reaches the notification path. NOTIFY earns its place on an idle
+queue. That is a prediction, and it is the next thing to measure.
 
 ## Running it
 
@@ -810,29 +841,49 @@ open http://localhost:8080
 ## Deployment
 
 Multi-stage build: `golang:1.25` builder with `CGO_ENABLED=0`, runtime on
-`gcr.io/distroless/static:nonroot`. One image holds all three binaries and the
-service picks one with its entrypoint, so the image is built once and shared.
-Templates and migrations are embedded in the binaries, so there is no "did you
-remember to copy `web/`" step.
+`gcr.io/distroless/static:nonroot`. One image holds all three binaries and each
+service picks one with its entrypoint, so it is built once and shared.
+Templates and migrations are embedded in the binaries — no "did you remember to
+copy `web/`" step.
 
-`make image-size` reports the size. It is not quoted here for the same reason
-the benchmarks are not: it was not measured on this machine.
+**Final image: 38.5 MB**, and the brief hoped for single digits, so here is why
+it is not.
+
+| | size |
+| --- | ---: |
+| `gcr.io/distroless/static:nonroot` base | ~0.7 MB |
+| `queued` binary | 14.6 MB |
+| `worker` binary | 14.0 MB |
+| `enqueue` binary | 12.8 MB |
+
+Stripped (`-s -w`) and trimmed already. Single-digit MB is reachable for a
+stdlib-only Go binary; it is not reachable with `pgx` and
+`prometheus/client_golang` linked in, and those are both load-bearing. Splitting
+into one image per binary would give **~15 MB each** but three images to build,
+tag and push — a worse trade for a queue whose whole premise is fewer moving
+parts.
+
+`make image-size` reports it, so the number stays honest if the dependencies
+change.
 
 The builder is `golang:1.25` rather than the 1.23 in the brief because current
-`pgx/v5` requires it. Pinning pgx back to an older release still left a floor of
-1.24 through transitive dependencies, so freezing the driver to hit an exact
-number was not worth it. Still satisfies "Go 1.23+".
+`pgx/v5` requires it; pinning pgx back still left a floor of 1.24 through
+transitive dependencies, so freezing the driver to hit an exact number was not
+worth it. Still satisfies "Go 1.23+".
 
 ## What this isn't
 
 **Not exactly-once.** Handlers must be idempotent. See
 [Why exactly-once is not on offer](#why-exactly-once-is-not-on-offer).
 
-**Not for throughput beyond roughly what phase 8 measures.** Every worker
-contends on one table and one index. When that stops being enough the next step
-is partitioning `jobs` by queue, or sharding by hash of the job id across
-several tables — at which point you have built most of a broker and should
-consider whether you actually want one.
+**Not for throughput much past ~10,000 jobs/sec per database.** That is the
+measured ceiling on a laptop VM, and the knee is at 4–16 workers. The binding
+constraint is four row versions per job for autovacuum to collect, not lock
+contention. Real hardware will do better, but not by an order of magnitude
+without changing the write pattern. When it stops being enough the honest
+ordering is: write less per job, then partition `jobs`, then shard — and only
+then consider a broker, which is a second stateful system to operate, back up,
+and be woken up by.
 
 **Not multi-tenant.** There is no tenant column, no per-tenant quota, and no
 isolation between queues beyond the name. One tenant enqueueing a million jobs
